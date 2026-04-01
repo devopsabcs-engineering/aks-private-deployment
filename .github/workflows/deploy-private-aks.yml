@@ -1,0 +1,165 @@
+name: Private AKS PoC - Deploy, Log, Teardown
+
+on:
+  workflow_dispatch:
+    inputs:
+      location:
+        description: 'Azure region (canadacentral or canadaeast)'
+        default: 'canadacentral'
+        type: string
+      wait_minutes:
+        description: 'Minutes to wait before teardown (cost control)'
+        default: '30'
+        type: string
+
+env:
+  RESOURCE_GROUP: rg-aks-poc-${{ github.run_id }}
+  CLUSTER_NAME: aks-poc-${{ github.run_id }}
+  VNET_NAME: vnet-aks-poc
+  SUBNET_NAME: subnet-aks
+  LOCATION: ${{ github.event.inputs.location || 'canadacentral' }}
+
+jobs:
+  deploy-log-teardown:
+    runs-on: self-hosted
+    timeout-minutes: 60
+
+    steps:
+      # ── 1. Checkout ────────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2. Azure Login ─────────────────────────────────────────
+      - name: Azure Login (Managed Identity)
+        uses: azure/login@v2
+        with:
+          auth-type: IDENTITY
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # ── 3. Record Runner IP ────────────────────────────────────
+      - name: Record runner IP
+        run: |
+          RUNNER_IP=$(curl -s ifconfig.me)
+          echo "RUNNER_IP=$RUNNER_IP" >> $GITHUB_ENV
+          echo "Runner public IP: $RUNNER_IP"
+
+      # ── 4. Create Resource Group ───────────────────────────────
+      - name: Create Resource Group
+        run: |
+          az group create \
+            --name "$RESOURCE_GROUP" \
+            --location "$LOCATION" \
+            --tags purpose=aks-poc created=$(date -u +%Y-%m-%dT%H:%M:%SZ) run=${{ github.run_id }}
+
+      # ── 5. Create VNet + Subnet ────────────────────────────────
+      - name: Create VNet and Subnet
+        run: |
+          az network vnet create \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$VNET_NAME" \
+            --address-prefixes 10.224.0.0/16 \
+            --subnet-name "$SUBNET_NAME" \
+            --subnet-prefixes 10.224.0.0/24
+
+          SUBNET_ID=$(az network vnet subnet show \
+            --resource-group "$RESOURCE_GROUP" \
+            --vnet-name "$VNET_NAME" \
+            --name "$SUBNET_NAME" \
+            --query id -o tsv)
+          echo "SUBNET_ID=$SUBNET_ID" >> $GITHUB_ENV
+
+      # ── 6. Record Start Time ───────────────────────────────────
+      - name: Record start time
+        run: |
+          echo "DEPLOY_START_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_ENV
+
+      # ── 7. Deploy Private AKS ──────────────────────────────────
+      - name: Deploy Private AKS Cluster
+        run: |
+          az aks create \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$CLUSTER_NAME" \
+            --node-count 1 \
+            --node-vm-size Standard_B2s \
+            --network-plugin azure \
+            --vnet-subnet-id "$SUBNET_ID" \
+            --enable-private-cluster \
+            --enable-managed-identity \
+            --generate-ssh-keys \
+            --tier free \
+            --no-wait || echo "DEPLOY_FAILED=true" >> $GITHUB_ENV
+
+      # ── 8. Wait for Provisioning ───────────────────────────────
+      - name: Wait for AKS provisioning
+        if: env.DEPLOY_FAILED != 'true'
+        run: |
+          az aks wait \
+            --resource-group "$RESOURCE_GROUP" \
+            --name "$CLUSTER_NAME" \
+            --created \
+            --timeout 1200
+
+      # ── 9. Log IPs (Activity Log) ─────────────────────────────
+      - name: Log IPs (Activity Log)
+        if: always()
+        run: |
+          echo "=== Runner VM Outbound IP ==="
+          echo "Runner IP: $RUNNER_IP"
+          echo ""
+
+          echo "Waiting 60s for Activity Log propagation..."
+          sleep 60
+
+          echo "=== ARM Operation Caller IPs (ContainerService) ==="
+          az monitor activity-log list \
+            --resource-group "$RESOURCE_GROUP" \
+            --start-time "$DEPLOY_START_TIME" \
+            --query "[?contains(operationName.value, 'Microsoft.ContainerService')].{op:operationName.value, caller:caller, clientIp:httpRequest.clientIpAddress, status:status.value, time:eventTimestamp}" \
+            -o table || echo "Activity log query failed for ContainerService"
+
+          echo ""
+          echo "=== ARM Operation Caller IPs (Network) ==="
+          az monitor activity-log list \
+            --resource-group "$RESOURCE_GROUP" \
+            --start-time "$DEPLOY_START_TIME" \
+            --query "[?contains(operationName.value, 'Microsoft.Network')].{op:operationName.value, caller:caller, clientIp:httpRequest.clientIpAddress, status:status.value, time:eventTimestamp}" \
+            -o table || echo "Activity log query failed for Network"
+
+          echo ""
+          echo "=== IP Comparison ==="
+          echo "Runner IP: $RUNNER_IP"
+          echo "Compare the clientIp values above against the runner IP to verify traffic routes."
+
+      # ── 10. Log IPs (Entra Sign-In) ────────────────────────────
+      - name: Log IPs (Entra Sign-In Logs)
+        if: always()
+        continue-on-error: true
+        run: |
+          echo "=== Entra ID Sign-In IPs (requires P1/P2) ==="
+          az rest --method get \
+            --url "https://graph.microsoft.com/v1.0/auditLogs/signIns?\$filter=createdDateTime ge $DEPLOY_START_TIME and appId eq '${{ secrets.AZURE_CLIENT_ID }}'" \
+            --query "value[].{ip:ipAddress, app:appDisplayName, time:createdDateTime, status:status.errorCode}" \
+            -o table || echo "Sign-in log query failed (may require Entra P1/P2)"
+
+      # ── 11. Wait Before Teardown ───────────────────────────────
+      - name: Wait before teardown
+        if: env.DEPLOY_FAILED != 'true'
+        run: |
+          WAIT=${{ github.event.inputs.wait_minutes || '30' }}
+          echo "Waiting ${WAIT} minutes before teardown..."
+          sleep $((WAIT * 60))
+
+      # ── 12. Teardown ───────────────────────────────────────────
+      - name: Teardown all resources
+        if: always()
+        run: |
+          echo "Deleting resource group $RESOURCE_GROUP..."
+          az group delete --name "$RESOURCE_GROUP" --yes --no-wait
+          echo "Resource group deletion initiated."
+
+      # ── 13. Azure Logout ───────────────────────────────────────
+      - name: Azure Logout
+        if: always()
+        run: az logout

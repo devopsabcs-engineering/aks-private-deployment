@@ -1,0 +1,61 @@
+name: Cleanup Safety Net
+
+on:
+  schedule:
+    - cron: '0 * * * *'
+  workflow_dispatch:
+
+jobs:
+  cleanup:
+    runs-on: self-hosted
+
+    steps:
+      # ── 1. Azure Login ─────────────────────────────────────────
+      - name: Azure Login (Managed Identity)
+        uses: azure/login@v2
+        with:
+          auth-type: IDENTITY
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # ── 2. Find and delete stale PoC resource groups ───────────
+      - name: Delete stale PoC resource groups
+        run: |
+          echo "Checking for stale aks-poc resource groups..."
+          STALE_COUNT=0
+
+          az group list --tag purpose=aks-poc --query "[].{name:name, created:tags.created}" -o tsv | while IFS=$'\t' read -r name created; do
+            if [ -z "$name" ]; then
+              continue
+            fi
+
+            if [ -z "$created" ]; then
+              echo "WARNING: Resource group '$name' has no 'created' tag timestamp — skipping"
+              continue
+            fi
+
+            created_epoch=$(date -d "$created" +%s 2>/dev/null || echo 0)
+            if [ "$created_epoch" -eq 0 ]; then
+              echo "WARNING: Could not parse timestamp '$created' for resource group '$name' — skipping"
+              continue
+            fi
+
+            now_epoch=$(date +%s)
+            age_minutes=$(( (now_epoch - created_epoch) / 60 ))
+
+            if [ "$age_minutes" -gt 45 ]; then
+              echo "Deleting stale resource group: $name (age: ${age_minutes} minutes)"
+              az group delete --name "$name" --yes --no-wait || true
+              STALE_COUNT=$((STALE_COUNT + 1))
+            else
+              echo "Keeping resource group: $name (age: ${age_minutes} minutes — under 45 min threshold)"
+            fi
+          done
+
+          echo "Cleanup complete."
+
+      # ── 3. Azure Logout ────────────────────────────────────────
+      - name: Azure Logout
+        if: always()
+        run: az logout
