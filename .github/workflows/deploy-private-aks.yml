@@ -12,74 +12,281 @@ on:
         default: '30'
         type: string
 
+permissions:
+  id-token: write # OIDC token for azure/login from GitHub-hosted runners
+  contents: read
+
 env:
-  RESOURCE_GROUP: rg-aks-poc-${{ github.run_id }}
+  LOCATION: ${{ github.event.inputs.location || 'canadacentral' }}
+  # Runner VM infrastructure (created/destroyed each run)
+  RUNNER_RG: rg-aks-poc-runner-${{ github.run_id }}
+  RUNNER_VM: vm-runner-${{ github.run_id }}
+  RUNNER_LABEL: aks-poc-runner-${{ github.run_id }}
+  MI_NAME: mi-aks-poc-deployer
+  # AKS deployment resources
+  AKS_RG: rg-aks-poc-${{ github.run_id }}
   CLUSTER_NAME: aks-poc-${{ github.run_id }}
   VNET_NAME: vnet-aks-poc
   SUBNET_NAME: subnet-aks
-  LOCATION: ${{ github.event.inputs.location || 'canadacentral' }}
 
 jobs:
-  deploy-log-teardown:
-    runs-on: self-hosted
-    timeout-minutes: 60
+  # ═══════════════════════════════════════════════════════════════
+  # Job 1: Provision runner VM on GitHub-hosted runner
+  # ═══════════════════════════════════════════════════════════════
+  # Uses ubuntu-latest (always available) to create an Azure VM,
+  # assign a managed identity, and register it as a self-hosted
+  # GitHub Actions runner for this repository.
+  # ═══════════════════════════════════════════════════════════════
+  setup-runner:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    outputs:
+      mi_client_id: ${{ steps.identity.outputs.mi_client_id }}
 
     steps:
-      # ── 1. Checkout ────────────────────────────────────────────
-      - name: Checkout repository
-        uses: actions/checkout@v4
-
-      # ── 2. Azure Login ─────────────────────────────────────────
-      - name: Azure Login (Managed Identity)
+      # ── 1a. Azure Login (OIDC from GitHub-hosted runner) ───────
+      - name: Azure Login
         uses: azure/login@v2
         with:
-          auth-type: IDENTITY
           client-id: ${{ secrets.AZURE_CLIENT_ID }}
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      # ── 3. Record Runner IP ────────────────────────────────────
+      # ── 1b. Create runner resource group ───────────────────────
+      - name: Create runner resource group
+        run: |
+          az group create \
+            --name "$RUNNER_RG" \
+            --location "$LOCATION" \
+            --tags purpose=aks-poc component=runner run=${{ github.run_id }}
+
+      # ── 1c. Create user-assigned managed identity ──────────────
+      - name: Create managed identity
+        id: identity
+        run: |
+          az identity create \
+            --name "$MI_NAME" \
+            --resource-group "$RUNNER_RG" \
+            --location "$LOCATION"
+
+          MI_CLIENT_ID=$(az identity show \
+            --name "$MI_NAME" \
+            --resource-group "$RUNNER_RG" \
+            --query clientId -o tsv)
+          MI_PRINCIPAL_ID=$(az identity show \
+            --name "$MI_NAME" \
+            --resource-group "$RUNNER_RG" \
+            --query principalId -o tsv)
+          MI_RESOURCE_ID=$(az identity show \
+            --name "$MI_NAME" \
+            --resource-group "$RUNNER_RG" \
+            --query id -o tsv)
+
+          echo "mi_client_id=$MI_CLIENT_ID" >> "$GITHUB_OUTPUT"
+          echo "MI_PRINCIPAL_ID=$MI_PRINCIPAL_ID" >> "$GITHUB_ENV"
+          echo "MI_RESOURCE_ID=$MI_RESOURCE_ID" >> "$GITHUB_ENV"
+
+      # ── 1d. Assign RBAC roles to the managed identity ─────────
+      - name: Assign RBAC roles
+        run: |
+          SUBSCRIPTION_ID=$(az account show --query id -o tsv)
+
+          az role assignment create \
+            --assignee-object-id "$MI_PRINCIPAL_ID" \
+            --assignee-principal-type ServicePrincipal \
+            --role "Contributor" \
+            --scope "/subscriptions/$SUBSCRIPTION_ID"
+
+          az role assignment create \
+            --assignee-object-id "$MI_PRINCIPAL_ID" \
+            --assignee-principal-type ServicePrincipal \
+            --role "Monitoring Reader" \
+            --scope "/subscriptions/$SUBSCRIPTION_ID"
+
+      # ── 1e. Create the runner VM with cloud-init ───────────────
+      - name: Create runner VM
+        run: |
+          cat > /tmp/cloud-init.yaml <<'CLOUD_INIT'
+          #cloud-config
+          package_update: true
+          package_upgrade: true
+          packages:
+            - curl
+            - jq
+            - unzip
+            - apt-transport-https
+            - ca-certificates
+            - gnupg
+            - lsb-release
+          runcmd:
+            - curl -sL https://aka.ms/InstallAzureCLIDeb | bash
+            - mkdir -p /home/azureuser/actions-runner
+            - chown azureuser:azureuser /home/azureuser/actions-runner
+            - |
+              RUNNER_VERSION=$(curl -s https://api.github.com/repos/actions/runner/releases/latest | jq -r '.tag_name' | sed 's/^v//')
+              curl -sL "https://github.com/actions/runner/releases/download/v${RUNNER_VERSION}/actions-runner-linux-x64-${RUNNER_VERSION}.tar.gz" \
+                -o /tmp/actions-runner.tar.gz
+              tar xzf /tmp/actions-runner.tar.gz -C /home/azureuser/actions-runner
+              chown -R azureuser:azureuser /home/azureuser/actions-runner
+              rm -f /tmp/actions-runner.tar.gz
+            - /home/azureuser/actions-runner/bin/installdependencies.sh
+          CLOUD_INIT
+
+          az vm create \
+            --resource-group "$RUNNER_RG" \
+            --name "$RUNNER_VM" \
+            --image Ubuntu2204 \
+            --size Standard_B2s \
+            --admin-username azureuser \
+            --generate-ssh-keys \
+            --assign-identity "$MI_RESOURCE_ID" \
+            --tags purpose=aks-poc component=runner \
+            --custom-data /tmp/cloud-init.yaml
+
+      # ── 1f. Wait for cloud-init to complete ────────────────────
+      - name: Wait for cloud-init
+        run: |
+          echo "Waiting for cloud-init to finish on the VM..."
+          for i in $(seq 1 30); do
+            STATUS=$(az vm run-command invoke \
+              --resource-group "$RUNNER_RG" \
+              --name "$RUNNER_VM" \
+              --command-id RunShellScript \
+              --scripts "cloud-init status 2>/dev/null | grep -q 'done' && echo 'DONE' || echo 'WAITING'" \
+              --query "value[0].message" -o tsv 2>/dev/null || echo "WAITING")
+            if echo "$STATUS" | grep -q "DONE"; then
+              echo "Cloud-init completed."
+              break
+            fi
+            echo "Attempt $i/30: still waiting..."
+            sleep 30
+          done
+
+      # ── 1g. Register as a GitHub Actions self-hosted runner ────
+      - name: Register GitHub Actions runner
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          # Get a registration token from the GitHub API
+          REG_TOKEN=$(curl -s -X POST \
+            -H "Authorization: token $GH_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runners/registration-token" \
+            | jq -r '.token')
+
+          if [ -z "$REG_TOKEN" ] || [ "$REG_TOKEN" = "null" ]; then
+            echo "::error::Failed to obtain runner registration token"
+            exit 1
+          fi
+
+          # Configure and start the runner on the VM via run-command
+          az vm run-command invoke \
+            --resource-group "$RUNNER_RG" \
+            --name "$RUNNER_VM" \
+            --command-id RunShellScript \
+            --scripts "
+              cd /home/azureuser/actions-runner
+              sudo -u azureuser ./config.sh \
+                --url https://github.com/${{ github.repository }} \
+                --token $REG_TOKEN \
+                --name $RUNNER_VM \
+                --labels $RUNNER_LABEL \
+                --unattended \
+                --replace
+              ./svc.sh install azureuser
+              ./svc.sh start
+            "
+
+      # ── 1h. Wait for runner to come online ─────────────────────
+      - name: Wait for runner to come online
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          echo "Waiting for self-hosted runner '$RUNNER_VM' to come online..."
+          for i in $(seq 1 20); do
+            ONLINE=$(curl -s \
+              -H "Authorization: token $GH_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/runners" \
+              | jq -r ".runners[] | select(.name == \"$RUNNER_VM\") | .status")
+            if [ "$ONLINE" = "online" ]; then
+              echo "Runner is online!"
+              exit 0
+            fi
+            echo "Attempt $i/20: runner status=${ONLINE:-not found}, waiting 15s..."
+            sleep 15
+          done
+          echo "::error::Runner did not come online within expected time"
+          exit 1
+
+  # ═══════════════════════════════════════════════════════════════
+  # Job 2: Deploy Private AKS on the self-hosted runner
+  # ═══════════════════════════════════════════════════════════════
+  # Runs on the VM provisioned in Job 1. The runner VM has a
+  # managed identity — tokens are acquired via IMDS, so
+  # Conditional Access location policies never apply.
+  # ═══════════════════════════════════════════════════════════════
+  deploy-and-log:
+    needs: setup-runner
+    runs-on: [self-hosted, "aks-poc-runner-${{ github.run_id }}"]
+    timeout-minutes: 60
+
+    steps:
+      # ── 2a. Checkout ───────────────────────────────────────────
+      - name: Checkout repository
+        uses: actions/checkout@v4
+
+      # ── 2b. Azure Login (Managed Identity on the runner VM) ────
+      - name: Azure Login (Managed Identity)
+        uses: azure/login@v2
+        with:
+          auth-type: IDENTITY
+          client-id: ${{ needs.setup-runner.outputs.mi_client_id }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # ── 2c. Record Runner IP ──────────────────────────────────
       - name: Record runner IP
         run: |
           RUNNER_IP=$(curl -s ifconfig.me)
           echo "RUNNER_IP=$RUNNER_IP" >> $GITHUB_ENV
           echo "Runner public IP: $RUNNER_IP"
 
-      # ── 4. Create Resource Group ───────────────────────────────
+      # ── 2d. Create AKS Resource Group ─────────────────────────
       - name: Create Resource Group
         run: |
           az group create \
-            --name "$RESOURCE_GROUP" \
+            --name "$AKS_RG" \
             --location "$LOCATION" \
             --tags purpose=aks-poc created=$(date -u +%Y-%m-%dT%H:%M:%SZ) run=${{ github.run_id }}
 
-      # ── 5. Create VNet + Subnet ────────────────────────────────
+      # ── 2e. Create VNet + Subnet ──────────────────────────────
       - name: Create VNet and Subnet
         run: |
           az network vnet create \
-            --resource-group "$RESOURCE_GROUP" \
+            --resource-group "$AKS_RG" \
             --name "$VNET_NAME" \
             --address-prefixes 10.224.0.0/16 \
             --subnet-name "$SUBNET_NAME" \
             --subnet-prefixes 10.224.0.0/24
 
           SUBNET_ID=$(az network vnet subnet show \
-            --resource-group "$RESOURCE_GROUP" \
+            --resource-group "$AKS_RG" \
             --vnet-name "$VNET_NAME" \
             --name "$SUBNET_NAME" \
             --query id -o tsv)
           echo "SUBNET_ID=$SUBNET_ID" >> $GITHUB_ENV
 
-      # ── 6. Record Start Time ───────────────────────────────────
+      # ── 2f. Record Start Time ─────────────────────────────────
       - name: Record start time
         run: |
           echo "DEPLOY_START_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_ENV
 
-      # ── 7. Deploy Private AKS ──────────────────────────────────
+      # ── 2g. Deploy Private AKS ────────────────────────────────
       - name: Deploy Private AKS Cluster
         run: |
           az aks create \
-            --resource-group "$RESOURCE_GROUP" \
+            --resource-group "$AKS_RG" \
             --name "$CLUSTER_NAME" \
             --node-count 1 \
             --node-vm-size Standard_B2s \
@@ -91,17 +298,17 @@ jobs:
             --tier free \
             --no-wait || echo "DEPLOY_FAILED=true" >> $GITHUB_ENV
 
-      # ── 8. Wait for Provisioning ───────────────────────────────
+      # ── 2h. Wait for Provisioning ─────────────────────────────
       - name: Wait for AKS provisioning
         if: env.DEPLOY_FAILED != 'true'
         run: |
           az aks wait \
-            --resource-group "$RESOURCE_GROUP" \
+            --resource-group "$AKS_RG" \
             --name "$CLUSTER_NAME" \
             --created \
             --timeout 1200
 
-      # ── 9. Log IPs (Activity Log) ─────────────────────────────
+      # ── 2i. Log IPs (Activity Log) ────────────────────────────
       - name: Log IPs (Activity Log)
         if: always()
         run: |
@@ -114,7 +321,7 @@ jobs:
 
           echo "=== ARM Operation Caller IPs (ContainerService) ==="
           az monitor activity-log list \
-            --resource-group "$RESOURCE_GROUP" \
+            --resource-group "$AKS_RG" \
             --start-time "$DEPLOY_START_TIME" \
             --query "[?contains(operationName.value, 'Microsoft.ContainerService')].{op:operationName.value, caller:caller, clientIp:httpRequest.clientIpAddress, status:status.value, time:eventTimestamp}" \
             -o table || echo "Activity log query failed for ContainerService"
@@ -122,7 +329,7 @@ jobs:
           echo ""
           echo "=== ARM Operation Caller IPs (Network) ==="
           az monitor activity-log list \
-            --resource-group "$RESOURCE_GROUP" \
+            --resource-group "$AKS_RG" \
             --start-time "$DEPLOY_START_TIME" \
             --query "[?contains(operationName.value, 'Microsoft.Network')].{op:operationName.value, caller:caller, clientIp:httpRequest.clientIpAddress, status:status.value, time:eventTimestamp}" \
             -o table || echo "Activity log query failed for Network"
@@ -132,18 +339,19 @@ jobs:
           echo "Runner IP: $RUNNER_IP"
           echo "Compare the clientIp values above against the runner IP to verify traffic routes."
 
-      # ── 10. Log IPs (Entra Sign-In) ────────────────────────────
+      # ── 2j. Log IPs (Entra Sign-In) ───────────────────────────
       - name: Log IPs (Entra Sign-In Logs)
         if: always()
         continue-on-error: true
         run: |
           echo "=== Entra ID Sign-In IPs (requires P1/P2) ==="
+          MI_CLIENT_ID="${{ needs.setup-runner.outputs.mi_client_id }}"
           az rest --method get \
-            --url "https://graph.microsoft.com/v1.0/auditLogs/signIns?\$filter=createdDateTime ge $DEPLOY_START_TIME and appId eq '${{ secrets.AZURE_CLIENT_ID }}'" \
+            --url "https://graph.microsoft.com/v1.0/auditLogs/signIns?\$filter=createdDateTime ge $DEPLOY_START_TIME and appId eq '${MI_CLIENT_ID}'" \
             --query "value[].{ip:ipAddress, app:appDisplayName, time:createdDateTime, status:status.errorCode}" \
             -o table || echo "Sign-in log query failed (may require Entra P1/P2)"
 
-      # ── 11. Wait Before Teardown ───────────────────────────────
+      # ── 2k. Wait Before Teardown ──────────────────────────────
       - name: Wait before teardown
         if: env.DEPLOY_FAILED != 'true'
         run: |
@@ -151,15 +359,78 @@ jobs:
           echo "Waiting ${WAIT} minutes before teardown..."
           sleep $((WAIT * 60))
 
-      # ── 12. Teardown ───────────────────────────────────────────
-      - name: Teardown all resources
+      # ── 2l. Teardown AKS Resources ────────────────────────────
+      - name: Teardown AKS resources
         if: always()
         run: |
-          echo "Deleting resource group $RESOURCE_GROUP..."
-          az group delete --name "$RESOURCE_GROUP" --yes --no-wait
+          echo "Deleting resource group $AKS_RG..."
+          az group delete --name "$AKS_RG" --yes --no-wait
           echo "Resource group deletion initiated."
 
-      # ── 13. Azure Logout ───────────────────────────────────────
+      # ── 2m. Azure Logout ───────────────────────────────────────
+      - name: Azure Logout
+        if: always()
+        run: az logout
+
+  # ═══════════════════════════════════════════════════════════════
+  # Job 3: Teardown runner VM (GitHub-hosted runner)
+  # ═══════════════════════════════════════════════════════════════
+  # Always runs — deregisters the self-hosted runner from the repo
+  # and deletes the runner VM resource group.
+  # ═══════════════════════════════════════════════════════════════
+  teardown-runner:
+    needs: [setup-runner, deploy-and-log]
+    if: always()
+    runs-on: ubuntu-latest
+    timeout-minutes: 15
+
+    steps:
+      # ── 3a. Azure Login ────────────────────────────────────────
+      - name: Azure Login
+        uses: azure/login@v2
+        with:
+          client-id: ${{ secrets.AZURE_CLIENT_ID }}
+          tenant-id: ${{ secrets.AZURE_TENANT_ID }}
+          subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
+
+      # ── 3b. Deregister runner from GitHub ──────────────────────
+      - name: Deregister self-hosted runner
+        continue-on-error: true
+        env:
+          GH_PAT: ${{ secrets.GH_PAT }}
+        run: |
+          RUNNER_ID=$(curl -s \
+            -H "Authorization: token $GH_PAT" \
+            -H "Accept: application/vnd.github+json" \
+            "https://api.github.com/repos/${{ github.repository }}/actions/runners" \
+            | jq -r ".runners[] | select(.name == \"$RUNNER_VM\") | .id")
+
+          if [ -n "$RUNNER_ID" ] && [ "$RUNNER_ID" != "null" ]; then
+            curl -s -X DELETE \
+              -H "Authorization: token $GH_PAT" \
+              -H "Accept: application/vnd.github+json" \
+              "https://api.github.com/repos/${{ github.repository }}/actions/runners/$RUNNER_ID"
+            echo "Runner deregistered (ID: $RUNNER_ID)."
+          else
+            echo "Runner not found or already removed."
+          fi
+
+      # ── 3c. Safety-net: ensure AKS RG is deleted ──────────────
+      - name: Ensure AKS resources are deleted
+        continue-on-error: true
+        run: |
+          if az group show --name "$AKS_RG" --output none 2>/dev/null; then
+            echo "AKS resource group still exists — deleting..."
+            az group delete --name "$AKS_RG" --yes --no-wait
+          fi
+
+      # ── 3d. Delete runner resource group ───────────────────────
+      - name: Delete runner resource group
+        run: |
+          az group delete --name "$RUNNER_RG" --yes --no-wait
+          echo "Runner resource group deletion initiated."
+
+      # ── 3e. Azure Logout ───────────────────────────────────────
       - name: Azure Logout
         if: always()
         run: az logout
