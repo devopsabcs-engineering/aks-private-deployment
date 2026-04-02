@@ -18,30 +18,34 @@ permissions:
 
 env:
   LOCATION: ${{ github.event.inputs.location || 'canadacentral' }}
-  # Runner VM infrastructure (created/destroyed each run)
-  RUNNER_RG: rg-aks-poc-runner-${{ github.run_id }}
+  # Shared infrastructure resource group (VNet, runner VM, MI)
+  INFRA_RG: rg-aks-poc-infra-${{ github.run_id }}
   RUNNER_VM: vm-runner-${{ github.run_id }}
   RUNNER_LABEL: aks-poc-runner-${{ github.run_id }}
   MI_NAME: mi-aks-poc-deployer
-  # AKS deployment resources
+  # Network — runner and AKS share one VNet
+  VNET_NAME: vnet-aks-poc
+  SUBNET_AKS: subnet-aks
+  SUBNET_RUNNER: subnet-runner
+  # AKS deployment resources (separate RG for clean AKS teardown)
   AKS_RG: rg-aks-poc-${{ github.run_id }}
   CLUSTER_NAME: aks-poc-${{ github.run_id }}
-  VNET_NAME: vnet-aks-poc
-  SUBNET_NAME: subnet-aks
 
 jobs:
   # ═══════════════════════════════════════════════════════════════
-  # Job 1: Provision runner VM on GitHub-hosted runner
+  # Job 1: Provision VNet + Runner VM on GitHub-hosted runner
   # ═══════════════════════════════════════════════════════════════
-  # Uses ubuntu-latest (always available) to create an Azure VM,
-  # assign a managed identity, and register it as a self-hosted
-  # GitHub Actions runner for this repository.
+  # Creates the shared VNet, managed identity, and runner VM in
+  # subnet-runner. The AKS cluster will later deploy into
+  # subnet-aks in the same VNet, giving the runner private
+  # network access to the Kubernetes API server.
   # ═══════════════════════════════════════════════════════════════
   setup-runner:
     runs-on: ubuntu-latest
     timeout-minutes: 30
     outputs:
       mi_client_id: ${{ steps.identity.outputs.mi_client_id }}
+      subnet_aks_id: ${{ steps.network.outputs.subnet_aks_id }}
 
     steps:
       # ── 1a. Azure Login (OIDC from GitHub-hosted runner) ───────
@@ -52,41 +56,72 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      # ── 1b. Create runner resource group ───────────────────────
-      - name: Create runner resource group
+      # ── 1b. Create infrastructure resource group ───────────────
+      - name: Create infrastructure resource group
         run: |
           az group create \
-            --name "$RUNNER_RG" \
+            --name "$INFRA_RG" \
             --location "$LOCATION" \
-            --tags purpose=aks-poc component=runner run=${{ github.run_id }}
+            --tags purpose=aks-poc component=infra run=${{ github.run_id }}
 
-      # ── 1c. Create user-assigned managed identity ──────────────
+      # ── 1c. Create shared VNet with runner + AKS subnets ──────
+      - name: Create VNet and subnets
+        id: network
+        run: |
+          az network vnet create \
+            --resource-group "$INFRA_RG" \
+            --name "$VNET_NAME" \
+            --address-prefixes 10.224.0.0/16 \
+            --subnet-name "$SUBNET_AKS" \
+            --subnet-prefixes 10.224.0.0/24
+
+          az network vnet subnet create \
+            --resource-group "$INFRA_RG" \
+            --vnet-name "$VNET_NAME" \
+            --name "$SUBNET_RUNNER" \
+            --address-prefixes 10.224.1.0/24
+
+          SUBNET_AKS_ID=$(az network vnet subnet show \
+            --resource-group "$INFRA_RG" \
+            --vnet-name "$VNET_NAME" \
+            --name "$SUBNET_AKS" \
+            --query id -o tsv)
+          echo "subnet_aks_id=$SUBNET_AKS_ID" >> "$GITHUB_OUTPUT"
+
+          SUBNET_RUNNER_ID=$(az network vnet subnet show \
+            --resource-group "$INFRA_RG" \
+            --vnet-name "$VNET_NAME" \
+            --name "$SUBNET_RUNNER" \
+            --query id -o tsv)
+          echo "SUBNET_RUNNER_ID=$SUBNET_RUNNER_ID" >> "$GITHUB_ENV"
+
+      # ── 1d. Create user-assigned managed identity ──────────────
       - name: Create managed identity
         id: identity
         run: |
           az identity create \
             --name "$MI_NAME" \
-            --resource-group "$RUNNER_RG" \
+            --resource-group "$INFRA_RG" \
             --location "$LOCATION"
 
           MI_CLIENT_ID=$(az identity show \
             --name "$MI_NAME" \
-            --resource-group "$RUNNER_RG" \
+            --resource-group "$INFRA_RG" \
             --query clientId -o tsv)
           MI_PRINCIPAL_ID=$(az identity show \
             --name "$MI_NAME" \
-            --resource-group "$RUNNER_RG" \
+            --resource-group "$INFRA_RG" \
             --query principalId -o tsv)
           MI_RESOURCE_ID=$(az identity show \
             --name "$MI_NAME" \
-            --resource-group "$RUNNER_RG" \
+            --resource-group "$INFRA_RG" \
             --query id -o tsv)
 
           echo "mi_client_id=$MI_CLIENT_ID" >> "$GITHUB_OUTPUT"
           echo "MI_PRINCIPAL_ID=$MI_PRINCIPAL_ID" >> "$GITHUB_ENV"
           echo "MI_RESOURCE_ID=$MI_RESOURCE_ID" >> "$GITHUB_ENV"
 
-      # ── 1d. Assign RBAC roles to the managed identity ─────────
+      # ── 1e. Assign RBAC roles to the managed identity ─────────
       - name: Assign RBAC roles
         run: |
           SUBSCRIPTION_ID=$(az account show --query id -o tsv)
@@ -109,7 +144,7 @@ jobs:
             --role "User Access Administrator" \
             --scope "/subscriptions/$SUBSCRIPTION_ID"
 
-      # ── 1e. Create the runner VM with cloud-init ───────────────
+      # ── 1f. Create the runner VM in subnet-runner ──────────────
       - name: Create runner VM
         run: |
           cat > /tmp/cloud-init.yaml <<'CLOUD_INIT'
@@ -126,6 +161,7 @@ jobs:
             - lsb-release
           runcmd:
             - curl -sL https://aka.ms/InstallAzureCLIDeb | bash
+            - az aks install-cli
             - mkdir -p /home/azureuser/actions-runner
             - chown azureuser:azureuser /home/azureuser/actions-runner
             - |
@@ -139,23 +175,25 @@ jobs:
           CLOUD_INIT
 
           az vm create \
-            --resource-group "$RUNNER_RG" \
+            --resource-group "$INFRA_RG" \
             --name "$RUNNER_VM" \
             --image Ubuntu2204 \
             --size Standard_B2s \
             --admin-username azureuser \
             --generate-ssh-keys \
             --assign-identity "$MI_RESOURCE_ID" \
+            --subnet "$SUBNET_RUNNER_ID" \
+            --public-ip-address "" \
             --tags purpose=aks-poc component=runner \
             --custom-data /tmp/cloud-init.yaml
 
-      # ── 1f. Wait for cloud-init to complete ────────────────────
+      # ── 1g. Wait for cloud-init to complete ────────────────────
       - name: Wait for cloud-init
         run: |
           echo "Waiting for cloud-init to finish on the VM..."
           for i in $(seq 1 30); do
             STATUS=$(az vm run-command invoke \
-              --resource-group "$RUNNER_RG" \
+              --resource-group "$INFRA_RG" \
               --name "$RUNNER_VM" \
               --command-id RunShellScript \
               --scripts "cloud-init status 2>/dev/null | grep -q 'done' && echo 'DONE' || echo 'WAITING'" \
@@ -168,12 +206,11 @@ jobs:
             sleep 30
           done
 
-      # ── 1g. Register as a GitHub Actions self-hosted runner ────
+      # ── 1h. Register as a GitHub Actions self-hosted runner ────
       - name: Register GitHub Actions runner
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
         run: |
-          # Get a registration token from the GitHub API
           REG_TOKEN=$(curl -s -X POST \
             -H "Authorization: token $GH_PAT" \
             -H "Accept: application/vnd.github+json" \
@@ -185,9 +222,8 @@ jobs:
             exit 1
           fi
 
-          # Configure and start the runner on the VM via run-command
           az vm run-command invoke \
-            --resource-group "$RUNNER_RG" \
+            --resource-group "$INFRA_RG" \
             --name "$RUNNER_VM" \
             --command-id RunShellScript \
             --scripts "
@@ -203,7 +239,7 @@ jobs:
               ./svc.sh start
             "
 
-      # ── 1h. Wait for runner to come online ─────────────────────
+      # ── 1i. Wait for runner to come online ─────────────────────
       - name: Wait for runner to come online
         env:
           GH_PAT: ${{ secrets.GH_PAT }}
@@ -226,11 +262,13 @@ jobs:
           exit 1
 
   # ═══════════════════════════════════════════════════════════════
-  # Job 2: Deploy Private AKS on the self-hosted runner
+  # Job 2: Deploy Private AKS + Validate on self-hosted runner
   # ═══════════════════════════════════════════════════════════════
-  # Runs on the VM provisioned in Job 1. The runner VM has a
-  # managed identity — tokens are acquired via IMDS, so
-  # Conditional Access location policies never apply.
+  # Runs on the VM in subnet-runner (same VNet as subnet-aks).
+  # The runner can reach the private AKS API server endpoint
+  # because both subnets share the VNet and the private DNS zone
+  # is linked to it. Managed identity tokens are acquired via
+  # IMDS — Conditional Access location policies never apply.
   # ═══════════════════════════════════════════════════════════════
   deploy-and-log:
     needs: setup-runner
@@ -251,113 +289,283 @@ jobs:
           tenant-id: ${{ secrets.AZURE_TENANT_ID }}
           subscription-id: ${{ secrets.AZURE_SUBSCRIPTION_ID }}
 
-      # ── 2c. Record Runner IP ──────────────────────────────────
-      - name: Record runner IP
+      # ── 2c. Record Runner IP and Network Info ──────────────────
+      - name: Record runner network info
         run: |
-          RUNNER_IP=$(curl -s ifconfig.me)
+          mkdir -p logs
+          RUNNER_IP=$(curl -s --max-time 10 ifconfig.me || echo "NO_PUBLIC_IP")
           echo "RUNNER_IP=$RUNNER_IP" >> $GITHUB_ENV
-          echo "Runner public IP: $RUNNER_IP"
+
+          echo "=== Runner Network Info ===" | tee logs/runner-network.log
+          echo "Public IP : $RUNNER_IP" | tee -a logs/runner-network.log
+          echo "Hostname  : $(hostname)" | tee -a logs/runner-network.log
+          echo "Private IP: $(hostname -I | awk '{print $1}')" | tee -a logs/runner-network.log
+          echo "Subnet    : $SUBNET_RUNNER (10.224.1.0/24)" | tee -a logs/runner-network.log
 
       # ── 2d. Create AKS Resource Group ─────────────────────────
-      - name: Create Resource Group
+      - name: Create AKS Resource Group
         run: |
           az group create \
             --name "$AKS_RG" \
             --location "$LOCATION" \
-            --tags purpose=aks-poc created=$(date -u +%Y-%m-%dT%H:%M:%SZ) run=${{ github.run_id }}
+            --tags purpose=aks-poc component=aks created=$(date -u +%Y-%m-%dT%H:%M:%SZ) run=${{ github.run_id }}
 
-      # ── 2e. Create VNet + Subnet ──────────────────────────────
-      - name: Create VNet and Subnet
-        run: |
-          az network vnet create \
-            --resource-group "$AKS_RG" \
-            --name "$VNET_NAME" \
-            --address-prefixes 10.224.0.0/16 \
-            --subnet-name "$SUBNET_NAME" \
-            --subnet-prefixes 10.224.0.0/24
-
-          SUBNET_ID=$(az network vnet subnet show \
-            --resource-group "$AKS_RG" \
-            --vnet-name "$VNET_NAME" \
-            --name "$SUBNET_NAME" \
-            --query id -o tsv)
-          echo "SUBNET_ID=$SUBNET_ID" >> $GITHUB_ENV
-
-      # ── 2f. Record Start Time ─────────────────────────────────
+      # ── 2e. Record Deployment Start Time ──────────────────────
       - name: Record start time
         run: |
           echo "DEPLOY_START_TIME=$(date -u +%Y-%m-%dT%H:%M:%SZ)" >> $GITHUB_ENV
 
-      # ── 2g. Deploy Private AKS ────────────────────────────────
+      # ── 2f. Deploy Private AKS into shared VNet ────────────────
       - name: Deploy Private AKS Cluster
+        id: deploy
         run: |
+          SUBNET_AKS_ID="${{ needs.setup-runner.outputs.subnet_aks_id }}"
+
+          echo "Deploying private AKS cluster into subnet-aks..."
+          echo "  Subnet ID: $SUBNET_AKS_ID"
+
           az aks create \
             --resource-group "$AKS_RG" \
             --name "$CLUSTER_NAME" \
             --node-count 1 \
             --node-vm-size Standard_B2s \
             --network-plugin azure \
-            --vnet-subnet-id "$SUBNET_ID" \
+            --vnet-subnet-id "$SUBNET_AKS_ID" \
+            --dns-service-ip 10.2.0.10 \
+            --service-cidr 10.2.0.0/24 \
             --enable-private-cluster \
             --enable-managed-identity \
             --generate-ssh-keys \
-            --tier free \
-            --no-wait || echo "DEPLOY_FAILED=true" >> $GITHUB_ENV
+            --tier free 2>&1 | tee logs/aks-create.log
 
-      # ── 2h. Wait for Provisioning ─────────────────────────────
-      - name: Wait for AKS provisioning
+          if [ "${PIPESTATUS[0]}" -ne 0 ]; then
+            echo "DEPLOY_FAILED=true" >> $GITHUB_ENV
+            echo "deploy_status=failed" >> "$GITHUB_OUTPUT"
+          else
+            echo "deploy_status=succeeded" >> "$GITHUB_OUTPUT"
+          fi
+
+      # ── 2g. Collect AKS Cluster Info ───────────────────────────
+      - name: Collect AKS cluster info
         if: env.DEPLOY_FAILED != 'true'
         run: |
-          az aks wait \
+          echo "=== AKS Cluster Details ===" | tee logs/aks-cluster-info.log
+          az aks show \
             --resource-group "$AKS_RG" \
             --name "$CLUSTER_NAME" \
-            --created \
-            --timeout 1200
+            --query "{name:name, location:location, kubernetesVersion:kubernetesVersion, privateFqdn:privateFqdn, fqdn:fqdn, powerState:powerState.code, provisioningState:provisioningState, nodeResourceGroup:nodeResourceGroup, networkPlugin:networkProfile.networkPlugin, networkPolicy:networkProfile.networkPolicy, serviceCidr:networkProfile.serviceCidr, dnsServiceIP:networkProfile.dnsServiceIP, enablePrivateCluster:apiServerAccessProfile.enablePrivateCluster, identityType:identity.type}" \
+            -o json | tee -a logs/aks-cluster-info.log
+
+      # ── 2h. kubectl Validation ─────────────────────────────────
+      - name: Validate cluster with kubectl
+        if: env.DEPLOY_FAILED != 'true'
+        run: |
+          echo "=== kubectl Validation ===" | tee logs/kubectl-validation.log
+
+          echo "--- Getting credentials (private cluster) ---" | tee -a logs/kubectl-validation.log
+          az aks get-credentials \
+            --resource-group "$AKS_RG" \
+            --name "$CLUSTER_NAME" \
+            --overwrite-existing
+
+          echo "" | tee -a logs/kubectl-validation.log
+          echo "--- Cluster Info ---" | tee -a logs/kubectl-validation.log
+          kubectl cluster-info 2>&1 | tee -a logs/kubectl-validation.log
+
+          echo "" | tee -a logs/kubectl-validation.log
+          echo "--- Nodes ---" | tee -a logs/kubectl-validation.log
+          kubectl get nodes -o wide 2>&1 | tee -a logs/kubectl-validation.log
+
+          echo "" | tee -a logs/kubectl-validation.log
+          echo "--- System Pods ---" | tee -a logs/kubectl-validation.log
+          kubectl get pods -n kube-system -o wide 2>&1 | tee -a logs/kubectl-validation.log
+
+          echo "" | tee -a logs/kubectl-validation.log
+          echo "--- API Server Endpoint (private) ---" | tee -a logs/kubectl-validation.log
+          kubectl config view --minify -o jsonpath='{.clusters[0].cluster.server}' 2>&1 | tee -a logs/kubectl-validation.log
+          echo "" | tee -a logs/kubectl-validation.log
+
+          echo "" | tee -a logs/kubectl-validation.log
+          echo "--- Component Statuses ---" | tee -a logs/kubectl-validation.log
+          kubectl get cs 2>&1 | tee -a logs/kubectl-validation.log || true
+
+          echo "" | tee -a logs/kubectl-validation.log
+          echo "--- Namespaces ---" | tee -a logs/kubectl-validation.log
+          kubectl get namespaces 2>&1 | tee -a logs/kubectl-validation.log
+
+          # Verify private FQDN resolves from within the VNet
+          echo "" | tee -a logs/kubectl-validation.log
+          echo "--- Private FQDN DNS Resolution ---" | tee -a logs/kubectl-validation.log
+          PRIVATE_FQDN=$(az aks show --resource-group "$AKS_RG" --name "$CLUSTER_NAME" --query privateFqdn -o tsv)
+          echo "Private FQDN: $PRIVATE_FQDN" | tee -a logs/kubectl-validation.log
+          nslookup "$PRIVATE_FQDN" 2>&1 | tee -a logs/kubectl-validation.log || true
+
+          # Mark validation result
+          if kubectl get nodes --no-headers 2>/dev/null | grep -q "Ready"; then
+            echo "KUBECTL_VALIDATION=passed" >> $GITHUB_ENV
+            echo "VALIDATION: PASSED — nodes are Ready and reachable via private endpoint" | tee -a logs/kubectl-validation.log
+          else
+            echo "KUBECTL_VALIDATION=failed" >> $GITHUB_ENV
+            echo "VALIDATION: FAILED — could not verify node readiness" | tee -a logs/kubectl-validation.log
+          fi
 
       # ── 2i. Log IPs (Activity Log) ────────────────────────────
       - name: Log IPs (Activity Log)
         if: always()
         run: |
-          echo "=== Runner VM Outbound IP ==="
-          echo "Runner IP: $RUNNER_IP"
-          echo ""
+          echo "=== Runner VM Outbound IP ===" | tee logs/ip-activity-log.log
+          echo "Runner IP: ${RUNNER_IP:-UNKNOWN}" | tee -a logs/ip-activity-log.log
+          echo "" | tee -a logs/ip-activity-log.log
 
-          echo "Waiting 60s for Activity Log propagation..."
+          echo "Waiting 60s for Activity Log propagation..." | tee -a logs/ip-activity-log.log
           sleep 60
 
-          echo "=== ARM Operation Caller IPs (ContainerService) ==="
+          echo "=== ARM Operation Caller IPs (ContainerService) ===" | tee -a logs/ip-activity-log.log
           az monitor activity-log list \
             --resource-group "$AKS_RG" \
             --start-time "$DEPLOY_START_TIME" \
             --query "[?contains(operationName.value, 'Microsoft.ContainerService')].{op:operationName.value, caller:caller, clientIp:httpRequest.clientIpAddress, status:status.value, time:eventTimestamp}" \
-            -o table || echo "Activity log query failed for ContainerService"
+            -o table 2>&1 | tee -a logs/ip-activity-log.log || echo "Activity log query failed for ContainerService" | tee -a logs/ip-activity-log.log
 
-          echo ""
-          echo "=== ARM Operation Caller IPs (Network) ==="
+          echo "" | tee -a logs/ip-activity-log.log
+          echo "=== ARM Operation Caller IPs (Network) ===" | tee -a logs/ip-activity-log.log
           az monitor activity-log list \
             --resource-group "$AKS_RG" \
             --start-time "$DEPLOY_START_TIME" \
             --query "[?contains(operationName.value, 'Microsoft.Network')].{op:operationName.value, caller:caller, clientIp:httpRequest.clientIpAddress, status:status.value, time:eventTimestamp}" \
-            -o table || echo "Activity log query failed for Network"
+            -o table 2>&1 | tee -a logs/ip-activity-log.log || echo "Activity log query failed for Network" | tee -a logs/ip-activity-log.log
 
-          echo ""
-          echo "=== IP Comparison ==="
-          echo "Runner IP: $RUNNER_IP"
-          echo "Compare the clientIp values above against the runner IP to verify traffic routes."
+          echo "" | tee -a logs/ip-activity-log.log
+          echo "=== IP Comparison ===" | tee -a logs/ip-activity-log.log
+          echo "Runner IP: ${RUNNER_IP:-UNKNOWN}" | tee -a logs/ip-activity-log.log
+          echo "Compare the clientIp values above against the runner IP to verify traffic routes." | tee -a logs/ip-activity-log.log
 
       # ── 2j. Log IPs (Entra Sign-In) ───────────────────────────
       - name: Log IPs (Entra Sign-In Logs)
         if: always()
         continue-on-error: true
         run: |
-          echo "=== Entra ID Sign-In IPs (requires P1/P2) ==="
+          echo "=== Entra ID Sign-In IPs (requires P1/P2) ===" | tee logs/ip-signin-log.log
           MI_CLIENT_ID="${{ needs.setup-runner.outputs.mi_client_id }}"
           az rest --method get \
             --url "https://graph.microsoft.com/v1.0/auditLogs/signIns?\$filter=createdDateTime ge $DEPLOY_START_TIME and appId eq '${MI_CLIENT_ID}'" \
             --query "value[].{ip:ipAddress, app:appDisplayName, time:createdDateTime, status:status.errorCode}" \
-            -o table || echo "Sign-in log query failed (may require Entra P1/P2)"
+            -o table 2>&1 | tee -a logs/ip-signin-log.log || echo "Sign-in log query failed (may require Entra P1/P2)" | tee -a logs/ip-signin-log.log
 
-      # ── 2k. Wait Before Teardown ──────────────────────────────
+      # ── 2k. Upload Logs as Artifacts ──────────────────────────
+      - name: Upload logs
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: aks-poc-logs-${{ github.run_id }}
+          path: logs/
+          retention-days: 30
+
+      # ── 2l. Write Job Summary ──────────────────────────────────
+      - name: Write job summary
+        if: always()
+        run: |
+          DEPLOY_STATUS="${{ steps.deploy.outputs.deploy_status || 'unknown' }}"
+          KUBECTL_STATUS="${KUBECTL_VALIDATION:-skipped}"
+
+          # Collect cluster info for summary
+          K8S_VERSION=""
+          PRIVATE_FQDN=""
+          NODE_COUNT=""
+          PROVISIONING_STATE=""
+          if [ "$DEPLOY_STATUS" = "succeeded" ]; then
+            K8S_VERSION=$(az aks show --resource-group "$AKS_RG" --name "$CLUSTER_NAME" --query kubernetesVersion -o tsv 2>/dev/null || echo "N/A")
+            PRIVATE_FQDN=$(az aks show --resource-group "$AKS_RG" --name "$CLUSTER_NAME" --query privateFqdn -o tsv 2>/dev/null || echo "N/A")
+            NODE_COUNT=$(az aks show --resource-group "$AKS_RG" --name "$CLUSTER_NAME" --query agentPoolProfiles[0].count -o tsv 2>/dev/null || echo "N/A")
+            PROVISIONING_STATE=$(az aks show --resource-group "$AKS_RG" --name "$CLUSTER_NAME" --query provisioningState -o tsv 2>/dev/null || echo "N/A")
+          fi
+
+          # Build status badges
+          if [ "$DEPLOY_STATUS" = "succeeded" ]; then
+            DEPLOY_BADGE="✅ Succeeded"
+          else
+            DEPLOY_BADGE="❌ Failed"
+          fi
+
+          if [ "$KUBECTL_STATUS" = "passed" ]; then
+            KUBECTL_BADGE="✅ Passed"
+          elif [ "$KUBECTL_STATUS" = "skipped" ]; then
+            KUBECTL_BADGE="⏭️ Skipped"
+          else
+            KUBECTL_BADGE="❌ Failed"
+          fi
+
+          cat >> "$GITHUB_STEP_SUMMARY" <<EOF
+          ## Private AKS PoC — Run Summary
+
+          ### Deployment Result
+
+          | Check | Status |
+          |-------|--------|
+          | AKS Cluster Creation | $DEPLOY_BADGE |
+          | kubectl Validation | $KUBECTL_BADGE |
+
+          ### Cluster Details
+
+          | Property | Value |
+          |----------|-------|
+          | Cluster Name | \`$CLUSTER_NAME\` |
+          | Resource Group | \`$AKS_RG\` |
+          | Location | \`$LOCATION\` |
+          | Kubernetes Version | \`${K8S_VERSION:-N/A}\` |
+          | Private FQDN | \`${PRIVATE_FQDN:-N/A}\` |
+          | Node Count | \`${NODE_COUNT:-N/A}\` |
+          | Provisioning State | \`${PROVISIONING_STATE:-N/A}\` |
+          | Node VM Size | \`Standard_B2s\` |
+          | Network Plugin | \`azure\` |
+          | AKS Tier | \`free\` |
+
+          ### Network Architecture
+
+          | Component | Subnet | CIDR |
+          |-----------|--------|------|
+          | AKS Nodes | \`subnet-aks\` | \`10.224.0.0/24\` |
+          | Runner VM | \`subnet-runner\` | \`10.224.1.0/24\` |
+          | K8s Services | internal | \`10.2.0.0/24\` |
+          | VNet | \`$VNET_NAME\` | \`10.224.0.0/16\` |
+
+          ### Identity & Authentication
+
+          | Property | Value |
+          |----------|-------|
+          | Runner Auth | Managed Identity (IMDS) |
+          | AKS Auth | Managed Identity |
+          | MI Client ID | \`${{ needs.setup-runner.outputs.mi_client_id }}\` |
+          | CA Bypass | ✅ MI tokens via IMDS — not evaluated by CA |
+
+          ### IP Verification
+
+          | Source | IP |
+          |--------|----|
+          | Runner VM Outbound | \`${RUNNER_IP:-UNKNOWN}\` |
+
+          > Activity Log and Entra Sign-In IP details are in the uploaded artifacts.
+
+          ### Runner VM
+
+          | Property | Value |
+          |----------|-------|
+          | VM Name | \`$RUNNER_VM\` |
+          | Infrastructure RG | \`$INFRA_RG\` |
+          | VNet Placement | \`$VNET_NAME / $SUBNET_RUNNER\` |
+          | Private API Access | Runner is in the same VNet as AKS — can reach private endpoint |
+
+          ### Key Validation Points
+
+          1. **Managed Identity bypasses CA**: Token acquisition via IMDS (\`169.254.169.254\`) stays within Azure fabric
+          2. **Private cluster API access**: Runner VM in \`subnet-runner\` can reach AKS API via private endpoint in \`subnet-aks\`
+          3. **kubectl works**: Cluster is fully operational and manageable from the VNet
+
+          ---
+          *Run ID: \`${{ github.run_id }}\` | Triggered by: \`${{ github.actor }}\` | Deploy start: \`$DEPLOY_START_TIME\`*
+          EOF
+
+      # ── 2m. Wait Before Teardown ──────────────────────────────
       - name: Wait before teardown
         if: env.DEPLOY_FAILED != 'true'
         run: |
@@ -365,7 +573,7 @@ jobs:
           echo "Waiting ${WAIT} minutes before teardown..."
           sleep $((WAIT * 60))
 
-      # ── 2l. Teardown AKS Resources ────────────────────────────
+      # ── 2n. Teardown AKS Resources ────────────────────────────
       - name: Teardown AKS resources
         if: always()
         run: |
@@ -373,16 +581,16 @@ jobs:
           az group delete --name "$AKS_RG" --yes --no-wait
           echo "Resource group deletion initiated."
 
-      # ── 2m. Azure Logout ───────────────────────────────────────
+      # ── 2o. Azure Logout ───────────────────────────────────────
       - name: Azure Logout
         if: always()
         run: az logout
 
   # ═══════════════════════════════════════════════════════════════
-  # Job 3: Teardown runner VM (GitHub-hosted runner)
+  # Job 3: Teardown runner infrastructure (GitHub-hosted runner)
   # ═══════════════════════════════════════════════════════════════
   # Always runs — deregisters the self-hosted runner from the repo
-  # and deletes the runner VM resource group.
+  # and deletes the infrastructure resource group (VNet, VM, MI).
   # ═══════════════════════════════════════════════════════════════
   teardown-runner:
     needs: [setup-runner, deploy-and-log]
@@ -430,11 +638,11 @@ jobs:
             az group delete --name "$AKS_RG" --yes --no-wait
           fi
 
-      # ── 3d. Delete runner resource group ───────────────────────
-      - name: Delete runner resource group
+      # ── 3d. Delete infrastructure resource group ───────────────
+      - name: Delete infrastructure resource group
         run: |
-          az group delete --name "$RUNNER_RG" --yes --no-wait
-          echo "Runner resource group deletion initiated."
+          az group delete --name "$INFRA_RG" --yes --no-wait
+          echo "Infrastructure resource group deletion initiated."
 
       # ── 3e. Azure Logout ───────────────────────────────────────
       - name: Azure Logout

@@ -2,7 +2,7 @@
 title: Private AKS Deployment PoC with Managed Identity
 description: Proof-of-concept demonstrating that managed identity bypasses Entra ID conditional access policies during private AKS cluster creation
 author: devopsabcs-engineering
-ms.date: 2026-04-01
+ms.date: 2026-04-02
 ms.topic: concept
 keywords:
   - azure kubernetes service
@@ -30,22 +30,40 @@ By running `az aks create --enable-managed-identity` from a self-hosted runner V
 
 ## Architecture
 
+The workflow runs in three jobs across two runner types. Job 1 provisions infrastructure on a GitHub-hosted runner; Job 2 deploys and validates AKS from the self-hosted runner inside the VNet; Job 3 tears everything down.
+
 ```mermaid
 graph TD
-    A[GitHub workflow_dispatch] --> B[Self-Hosted Runner VM]
-    B --> C[az login --identity]
-    C --> D[Create Resource Group + VNet]
-    D --> E[az aks create --enable-private-cluster --enable-managed-identity]
-    E --> F{Deploy OK?}
-    F -->|Yes| G[Log IPs from Activity Log + Sign-in Logs]
-    G --> H[Wait 30 minutes]
-    H --> I[az group delete — teardown]
-    F -->|No| J[Log IPs + Error Info]
-    J --> I
+    A[GitHub workflow_dispatch] -->|ubuntu-latest| B["Job 1: Setup Infrastructure"]
+    B --> B1[Create VNet<br/>subnet-aks + subnet-runner]
+    B1 --> B2[Create MI + RBAC]
+    B2 --> B3[Create Runner VM<br/>in subnet-runner]
+    B3 --> B4[Register GH Actions Runner]
+
+    B4 -->|self-hosted runner| C["Job 2: Deploy + Validate"]
+    C --> C1[az login --identity via IMDS]
+    C1 --> C2[az aks create<br/>--enable-private-cluster<br/>into subnet-aks]
+    C2 --> C3{Deploy OK?}
+    C3 -->|Yes| C4[kubectl get nodes<br/>via private endpoint]
+    C4 --> C5[Log IPs + Upload Artifacts]
+    C5 --> C6[Write Job Summary]
+    C6 --> C7[Wait N minutes]
+    C7 --> C8[Delete AKS RG]
+    C3 -->|No| C5
+
+    C8 -->|ubuntu-latest| D["Job 3: Teardown"]
+    D --> D1[Deregister Runner]
+    D1 --> D2[Delete Infra RG]
+
+    subgraph "Shared VNet — 10.224.0.0/16"
+        S1[subnet-aks<br/>10.224.0.0/24]
+        S2[subnet-runner<br/>10.224.1.0/24]
+        S1 -.->|private endpoint| S2
+    end
 
     subgraph "Identity Flow — No CA"
-        C -.->|IMDS 169.254.169.254| K[Azure Fabric Token]
-        E -.->|Cluster MI via IMDS| K
+        C1 -.->|IMDS 169.254.169.254| K[Azure Fabric Token]
+        C2 -.->|Cluster MI via IMDS| K
     end
 ```
 
@@ -67,26 +85,29 @@ The distinction is architectural: managed identities do not trigger conditional 
 
 ## Prerequisites
 
-* Azure subscription with permissions to create AKS clusters and managed identities
-* Azure CLI v2.28.0 or later
+* Azure subscription with permissions to create AKS clusters, VMs, VNets, and managed identities
+* An Azure AD app registration with OIDC federated credentials for GitHub Actions (used by Jobs 1 and 3 on `ubuntu-latest`)
+* The OIDC service principal needs `Contributor` + `User Access Administrator` at subscription scope
 * GitHub repository with Actions enabled
-* Self-hosted runner VM in Azure with a user-assigned managed identity (`Contributor` + `User Access Administrator` on the subscription)
+* A GitHub PAT (`GH_PAT` secret) with `repo` scope for runner registration/deregistration
 
 ## Quick Start
 
-1. Run `scripts/setup-runner-vm.sh` to provision the runner VM and managed identity in `rg-aks-poc-runner`.
+1. Create an Azure AD app registration with OIDC federated credentials for the `main` branch of this repository.
 
-2. SSH into the VM and configure the GitHub Actions self-hosted runner. Follow
-   [Adding self-hosted runners](https://docs.github.com/en/actions/hosting-your-own-runners/managing-self-hosted-runners/adding-self-hosted-runners).
+2. Assign `Contributor` + `User Access Administrator` roles to the app's service principal at subscription scope.
 
 3. Add these GitHub Actions secrets to the repository:
-   * `AZURE_CLIENT_ID`: The client ID of the managed identity `mi-aks-poc-deployer`
+   * `AZURE_CLIENT_ID`: The app registration client ID (for OIDC on GitHub-hosted runners)
    * `AZURE_TENANT_ID`: Your Entra ID tenant ID
    * `AZURE_SUBSCRIPTION_ID`: Target Azure subscription ID
+   * `GH_PAT`: A GitHub PAT with `repo` scope (for runner registration)
 
 4. Trigger the **deploy-private-aks** workflow from the GitHub Actions UI (workflow_dispatch).
 
-5. Alternatively, run `scripts/deploy-private-aks.sh` directly on any VM that has a managed identity with the required permissions.
+5. The workflow automatically provisions a runner VM in the AKS VNet, deploys the private cluster, validates it with `kubectl`, and tears everything down.
+
+6. Alternatively, run `scripts/deploy-private-aks.sh` directly on any VM that has a managed identity with the required permissions.
 
 ## File Structure
 
@@ -108,11 +129,15 @@ The distinction is architectural: managed identities do not trigger conditional 
 
 ### deploy-private-aks.yml
 
-A 13-step workflow triggered by `workflow_dispatch`. It authenticates via managed identity, creates a resource group (`rg-aks-poc-<run_id>`), deploys a private AKS cluster, logs IP addresses from Azure Activity Log and Entra ID sign-in logs, waits 30 minutes for log propagation, and tears down all resources. A Dead Man's Switch pattern ensures cleanup runs even if intermediate steps fail.
+A three-job workflow triggered by `workflow_dispatch`:
+
+* **Job 1 (`setup-runner`)**: Runs on `ubuntu-latest` via OIDC. Creates a shared VNet with two subnets (`subnet-aks` and `subnet-runner`), provisions a managed identity with RBAC, creates a runner VM in `subnet-runner`, and registers it as a GitHub Actions self-hosted runner.
+* **Job 2 (`deploy-and-log`)**: Runs on the self-hosted runner. Authenticates via managed identity (IMDS), deploys a private AKS cluster into `subnet-aks`, validates the cluster with `kubectl` (possible because the runner is in the same VNet), logs IPs, uploads all logs as artifacts, and writes a structured job summary.
+* **Job 3 (`teardown-runner`)**: Runs on `ubuntu-latest`. Deregisters the runner, deletes the AKS resource group (safety net), and deletes the infrastructure resource group. Always runs, even if previous jobs fail.
 
 ### cleanup-safety-net.yml
 
-An hourly cron-triggered workflow that scans for resource groups matching the `rg-aks-poc-*` pattern older than 45 minutes. This acts as a safety net to delete orphaned resources left behind by failed or interrupted deployment runs.
+A manually triggered workflow (schedule disabled) that scans for resource groups matching the `rg-aks-poc-*` pattern older than 45 minutes. Acts as a safety net to delete orphaned resources left behind by failed or interrupted deployment runs.
 
 ## IP Logging
 
@@ -124,17 +149,29 @@ The PoC captures IP addresses from multiple sources to confirm that managed iden
 
 To verify correct behavior, compare the Activity Log IPs against the runner outbound IP. Matching IPs confirm that ARM calls originate from the runner VM rather than from unexpected Azure datacenter addresses.
 
+## Validation
+
+The workflow validates three key properties:
+
+1. **Managed Identity bypasses CA**: Token acquisition via IMDS (`169.254.169.254`) stays within the Azure fabric. Activity Log IP comparison confirms ARM calls originate from the runner VM.
+2. **Private cluster API access**: The runner VM in `subnet-runner` can reach the AKS API server via its private endpoint in `subnet-aks` because both subnets share the same VNet. DNS resolution of the private FQDN is verified.
+3. **Cluster is operational**: `kubectl get nodes` confirms nodes are `Ready` and the cluster is fully manageable from within the VNet.
+
+All validation results, logs, and cluster details are captured in the GitHub Actions **Job Summary** and uploaded as **artifacts** for each run.
+
 ## Cost Estimate
 
-Each 30-minute PoC run costs approximately $0.05 to $0.08 with a single Standard_B2s node on the Free tier AKS control plane. The runner VM is the primary ongoing cost at approximately $0.042/hr when running.
+Each 30-minute PoC run costs approximately $0.05 to $0.08 with a single Standard_B2s node on the Free tier AKS control plane. The runner VM runs only for the duration of the workflow and is automatically deleted.
 
 ## Cleanup
 
-1. Run `scripts/teardown-runner-vm.sh` to delete the runner VM, managed identity, and the `rg-aks-poc-runner` resource group.
-2. Deregister the self-hosted runner from your GitHub repository under **Settings > Actions > Runners**.
+The workflow handles all cleanup automatically via Job 3 (`teardown-runner`). For manual cleanup:
+
+1. Run `scripts/teardown-runner-vm.sh` to delete persistent runner infrastructure.
+2. Deregister any orphaned runners under **Settings > Actions > Runners**.
 
 > [!IMPORTANT]
-> The cleanup-safety-net workflow handles PoC resource groups automatically, but the runner VM infrastructure requires manual teardown.
+> The workflow's Job 3 always runs (even on failure) and cleans up both the AKS and infrastructure resource groups. Manual cleanup is only needed if the workflow itself is cancelled before Job 3 executes.
 
 ## Key References
 
