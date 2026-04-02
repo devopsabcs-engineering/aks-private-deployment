@@ -178,3 +178,76 @@ The workflow handles all cleanup automatically via Job 3 (`teardown-runner`). Fo
 * [Azure Private AKS Clusters](https://learn.microsoft.com/en-us/azure/aks/private-clusters)
 * [Use Managed Identity with AKS](https://learn.microsoft.com/en-us/azure/aks/use-managed-identity)
 * [Conditional Access for Workload Identities](https://learn.microsoft.com/en-us/entra/identity/conditional-access/workload-identity)
+
+## Verified Run — April 2, 2026
+
+> **Workflow run**: [#23919580744](https://github.com/devopsabcs-engineering/aks-private-deployment/actions/runs/23919580744)
+> **Result**: All 3 jobs succeeded. PoC objectives confirmed.
+
+### Job execution
+
+| Job | Runner | Duration | Result |
+|-----|--------|----------|--------|
+| `setup-runner` | `ubuntu-latest` | 7 min | Success |
+| `deploy-and-log` | `self-hosted` (in-VNet) | 40 min (incl. 30 min wait) | Success |
+| `teardown-runner` | `ubuntu-latest` | 18 sec | Success |
+
+### Finding 1: Managed Identity bypasses Conditional Access
+
+The Azure Activity Log confirms the `az aks create` ARM write operation originated from IP `20.104.78.99` — the runner VM's own public IP. Authentication happened via IMDS (`169.254.169.254`), not through `login.microsoftonline.com`. No Conditional Access evaluation was triggered.
+
+```text
+Activity Log excerpt:
+  Microsoft.ContainerService/managedClusters/write  Accepted  ClientIp: 20.104.78.99
+  Microsoft.ContainerService/managedClusters/write  Started   ClientIp: 20.104.78.99
+```
+
+The `resolvePrivateLinkServiceId` action shows IP `52.136.23.11`. This is the AKS Resource Provider acting internally — expected behavior, not the customer's identity.
+
+### Finding 2: Private cluster is truly private
+
+```text
+enablePrivateCluster : true
+privateFqdn          : aks-poc-23-rg-aks-poc-23919-...-hzi38m4i.b888736e-...privatelink.canadacentral.azmk8s.io
+API Server Endpoint  : https://...privatelink.canadacentral.azmk8s.io:443
+Private FQDN resolves: 10.224.0.4 (private IP within the VNet)
+```
+
+The AKS API server is accessible only via private endpoint. No public API access is possible.
+
+### Finding 3: Runner VM in same VNet reaches private API server
+
+The runner VM at `10.224.1.4` (subnet-runner) successfully connected to the AKS API server at `10.224.0.4` (subnet-aks) via the private endpoint:
+
+```text
+Runner VM  : 10.224.1.4  (subnet-runner / 10.224.1.0/24)
+AKS Node   : 10.224.0.5  (subnet-aks / 10.224.0.0/24)
+API Server : 10.224.0.4  (private endpoint)
+```
+
+`kubectl` validated the cluster end-to-end:
+
+```text
+kubectl cluster-info  → Kubernetes control plane running at ...privatelink.canadacentral.azmk8s.io:443
+kubectl get nodes     → 1 node, Ready, v1.34.4
+kubectl get pods -n kube-system → 15 pods, all Running
+kubectl get namespaces → default, kube-node-lease, kube-public, kube-system
+nslookup private FQDN → 10.224.0.4 ✓
+```
+
+### Finding 4: Artifacts uploaded
+
+Six log files were uploaded as workflow artifacts (`aks-poc-logs-23919580744`):
+
+| Log file | Content |
+|----------|---------|
+| `runner-network.log` | Runner VM public/private IP, hostname, subnet |
+| `aks-create.log` | Full `az aks create` output (9 KB) |
+| `aks-cluster-info.log` | Cluster properties (version, FQDN, network config) |
+| `kubectl-validation.log` | All kubectl output including DNS resolution |
+| `ip-activity-log.log` | Azure Activity Log ARM operation caller IPs |
+| `ip-signin-log.log` | Entra sign-in query (expected 403 without P1/P2) |
+
+### Conclusion
+
+The PoC confirms that managed identity is the correct solution for deploying private AKS clusters in environments with Conditional Access location policies. The self-hosted runner VM, placed inside the same VNet as the AKS cluster, can both deploy and manage the private cluster without triggering any CA evaluation.
