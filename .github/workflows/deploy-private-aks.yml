@@ -103,6 +103,12 @@ jobs:
             --role "Monitoring Reader" \
             --scope "/subscriptions/$SUBSCRIPTION_ID"
 
+          az role assignment create \
+            --assignee-object-id "$MI_PRINCIPAL_ID" \
+            --assignee-principal-type ServicePrincipal \
+            --role "User Access Administrator" \
+            --scope "/subscriptions/$SUBSCRIPTION_ID"
+
       # ── 1e. Create the runner VM with cloud-init ───────────────
       - name: Create runner VM
         run: |
