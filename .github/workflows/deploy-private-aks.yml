@@ -45,7 +45,6 @@ jobs:
     timeout-minutes: 30
     outputs:
       mi_client_id: ${{ steps.identity.outputs.mi_client_id }}
-      subnet_aks_id: ${{ steps.network.outputs.subnet_aks_id }}
 
     steps:
       # ── 1a. Azure Login (OIDC from GitHub-hosted runner) ───────
@@ -319,10 +318,19 @@ jobs:
       - name: Deploy Private AKS Cluster
         id: deploy
         run: |
-          SUBNET_AKS_ID="${{ needs.setup-runner.outputs.subnet_aks_id }}"
+          SUBNET_AKS_ID=$(az network vnet subnet show \
+            --resource-group "$INFRA_RG" \
+            --vnet-name "$VNET_NAME" \
+            --name "$SUBNET_AKS" \
+            --query id -o tsv)
 
           echo "Deploying private AKS cluster into subnet-aks..."
           echo "  Subnet ID: $SUBNET_AKS_ID"
+
+          if [ -z "$SUBNET_AKS_ID" ]; then
+            echo "::error::Failed to resolve subnet ID for $SUBNET_AKS in $VNET_NAME"
+            exit 1
+          fi
 
           az aks create \
             --resource-group "$AKS_RG" \
