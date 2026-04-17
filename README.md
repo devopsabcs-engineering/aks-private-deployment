@@ -175,7 +175,7 @@ The workflow handles all cleanup automatically via Job 3 (`teardown-runner`). Fo
 
 ## Key References
 
-* [Azure Private AKS Clusters](https://learn.microsoft.com/en-us/azure/aks/private-clusters)
+* [Azure Private AKS Clusters](https://learn.microsoft.com/en-us/azure/aks/private-clusters?pivots=azure-cli)
 * [Use Managed Identity with AKS](https://learn.microsoft.com/en-us/azure/aks/use-managed-identity)
 * [Conditional Access for Workload Identities](https://learn.microsoft.com/en-us/entra/identity/conditional-access/workload-identity)
 
