@@ -1,0 +1,750 @@
+<!DOCTYPE html>
+<html lang="fr">
+<head>
+<meta charset="UTF-8">
+<meta name="viewport" content="width=device-width, initial-scale=1.0">
+<title>PoC de déploiement AKS privé | Identité managée et accès conditionnel</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link href="https://fonts.googleapis.com/css2?family=Inter:wght@400;500;600;700;800&family=JetBrains+Mono:wght@400;500&display=swap" rel="stylesheet">
+<script src="https://cdn.jsdelivr.net/npm/mermaid@11/dist/mermaid.min.js"></script>
+<style>
+:root {
+  --gh-blue: #0969da;
+  --gh-dark: #0d1117;
+  --gh-gray-dark: #1c2128;
+  --gh-gray: #30363d;
+  --gh-gray-light: #484f58;
+  --gh-border: #30363d;
+  --gh-text: #e6edf3;
+  --gh-text-muted: #8b949e;
+  --gh-green: #3fb950;
+  --gh-purple: #a371f7;
+  --gh-orange: #d29922;
+  --gh-red: #f85149;
+  --gh-cyan: #58a6ff;
+  --accent-gradient: linear-gradient(135deg, #58a6ff, #a371f7);
+  --card-bg: #161b22;
+  --card-border: #21262d;
+}
+
+* { margin: 0; padding: 0; box-sizing: border-box; }
+
+body {
+  font-family: 'Inter', -apple-system, BlinkMacSystemFont, 'Segoe UI', Helvetica, Arial, sans-serif;
+  background-color: var(--gh-dark);
+  color: var(--gh-text);
+  line-height: 1.7;
+  font-size: 16px;
+}
+
+.hero {
+  background: linear-gradient(135deg, #0d1117 0%, #161b22 40%, #1a1e2e 70%, #0d1117 100%);
+  border-bottom: 1px solid var(--card-border);
+  padding: 80px 20px 60px;
+  text-align: center;
+  position: relative;
+  overflow: hidden;
+}
+.hero::before {
+  content: '';
+  position: absolute;
+  top: -50%; left: -50%;
+  width: 200%; height: 200%;
+  background: radial-gradient(ellipse at 30% 50%, rgba(88,166,255,0.06) 0%, transparent 50%),
+              radial-gradient(ellipse at 70% 50%, rgba(163,113,247,0.06) 0%, transparent 50%);
+  pointer-events: none;
+}
+.hero-badge {
+  display: inline-block;
+  background: rgba(88,166,255,0.1);
+  border: 1px solid rgba(88,166,255,0.25);
+  color: var(--gh-cyan);
+  font-size: 0.8rem;
+  font-weight: 600;
+  padding: 6px 16px;
+  border-radius: 20px;
+  text-transform: uppercase;
+  letter-spacing: 1.5px;
+  margin-bottom: 24px;
+  position: relative;
+}
+.hero h1 {
+  font-size: clamp(2rem, 5vw, 3.2rem);
+  font-weight: 800;
+  background: var(--accent-gradient);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+  margin-bottom: 16px;
+  position: relative;
+}
+.hero .subtitle {
+  font-size: 1.15rem;
+  color: var(--gh-text-muted);
+  max-width: 750px;
+  margin: 0 auto 32px;
+  position: relative;
+}
+.hero-meta {
+  font-size: 0.85rem;
+  color: var(--gh-text-muted);
+  position: relative;
+}
+.hero-meta span { margin: 0 12px; }
+.lang-switch {
+  margin-top: 16px;
+  position: relative;
+}
+.lang-switch a {
+  color: var(--gh-cyan);
+  text-decoration: none;
+  font-size: 0.85rem;
+  border: 1px solid rgba(88,166,255,0.25);
+  padding: 4px 12px;
+  border-radius: 16px;
+  transition: all 0.2s;
+}
+.lang-switch a:hover {
+  background: rgba(88,166,255,0.1);
+  text-decoration: none;
+}
+
+.toc {
+  background: var(--card-bg);
+  border-bottom: 1px solid var(--card-border);
+  padding: 0 20px;
+  position: sticky;
+  top: 0;
+  z-index: 100;
+  overflow-x: auto;
+  white-space: nowrap;
+}
+.toc-inner {
+  max-width: 1200px;
+  margin: 0 auto;
+  display: flex;
+  gap: 0;
+}
+.toc a {
+  display: inline-block;
+  padding: 14px 18px;
+  color: var(--gh-text-muted);
+  text-decoration: none;
+  font-size: 0.85rem;
+  font-weight: 500;
+  border-bottom: 2px solid transparent;
+  transition: all 0.2s;
+}
+.toc a:hover {
+  color: var(--gh-text);
+  border-bottom-color: var(--gh-cyan);
+  background: rgba(88,166,255,0.05);
+}
+
+.container {
+  max-width: 1100px;
+  margin: 0 auto;
+  padding: 0 24px;
+}
+
+section {
+  padding: 64px 0;
+  border-bottom: 1px solid var(--card-border);
+}
+section:last-of-type { border-bottom: none; }
+
+h2 {
+  font-size: 2rem;
+  font-weight: 700;
+  margin-bottom: 12px;
+  color: var(--gh-text);
+}
+h2 .section-num {
+  color: var(--gh-cyan);
+  font-weight: 800;
+  margin-right: 8px;
+}
+.section-lead {
+  font-size: 1.05rem;
+  color: var(--gh-text-muted);
+  margin-bottom: 40px;
+  max-width: 800px;
+}
+
+h3 {
+  font-size: 1.35rem;
+  font-weight: 600;
+  margin: 40px 0 16px;
+  color: var(--gh-text);
+  padding-bottom: 8px;
+  border-bottom: 1px solid var(--card-border);
+}
+
+h4 {
+  font-size: 1.1rem;
+  font-weight: 600;
+  margin: 24px 0 12px;
+  color: var(--gh-text);
+}
+
+p { margin-bottom: 16px; }
+strong { color: #f0f6fc; }
+a { color: var(--gh-cyan); text-decoration: none; }
+a:hover { text-decoration: underline; }
+
+blockquote {
+  background: rgba(88,166,255,0.05);
+  border-left: 4px solid var(--gh-cyan);
+  padding: 20px 24px;
+  margin: 24px 0;
+  border-radius: 0 8px 8px 0;
+  font-style: italic;
+  color: var(--gh-text-muted);
+}
+blockquote strong { color: var(--gh-text); font-style: normal; }
+
+.card-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(300px, 1fr));
+  gap: 20px;
+  margin: 24px 0;
+}
+.card {
+  background: var(--card-bg);
+  border: 1px solid var(--card-border);
+  border-radius: 12px;
+  padding: 24px;
+  transition: border-color 0.2s, transform 0.2s;
+}
+.card:hover {
+  border-color: var(--gh-cyan);
+  transform: translateY(-2px);
+}
+.card-icon { font-size: 1.6rem; margin-bottom: 12px; display: block; }
+.card h4 { font-size: 1.05rem; font-weight: 600; margin-bottom: 8px; color: var(--gh-text); border: none; }
+.card p { font-size: 0.9rem; color: var(--gh-text-muted); margin-bottom: 0; }
+
+.table-wrapper {
+  overflow-x: auto;
+  margin: 24px 0;
+  border-radius: 12px;
+  border: 1px solid var(--card-border);
+}
+table {
+  width: 100%;
+  border-collapse: collapse;
+  font-size: 0.9rem;
+}
+thead { background: rgba(88,166,255,0.08); }
+th {
+  text-align: left;
+  padding: 14px 16px;
+  font-weight: 600;
+  color: var(--gh-text);
+  border-bottom: 1px solid var(--card-border);
+  white-space: nowrap;
+}
+td {
+  padding: 12px 16px;
+  border-bottom: 1px solid var(--card-border);
+  color: var(--gh-text-muted);
+  vertical-align: top;
+}
+tr:last-child td { border-bottom: none; }
+tr:hover td { background: rgba(88,166,255,0.03); }
+td strong { color: var(--gh-text); }
+
+.stats-row {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(160px, 1fr));
+  gap: 16px;
+  margin: 32px 0;
+}
+.stat-card {
+  background: var(--card-bg);
+  border: 1px solid var(--card-border);
+  border-radius: 12px;
+  padding: 20px;
+  text-align: center;
+}
+.stat-card .stat-value {
+  font-size: 2rem;
+  font-weight: 800;
+  background: var(--accent-gradient);
+  -webkit-background-clip: text;
+  -webkit-text-fill-color: transparent;
+  background-clip: text;
+}
+.stat-card .stat-label {
+  font-size: 0.8rem;
+  color: var(--gh-text-muted);
+  margin-top: 4px;
+}
+
+ul, ol { margin: 16px 0 16px 24px; }
+li { margin-bottom: 8px; color: var(--gh-text-muted); }
+li strong { color: var(--gh-text); }
+
+.mermaid-wrapper {
+  margin: 32px 0;
+  padding: 24px;
+  background: var(--card-bg);
+  border: 1px solid var(--card-border);
+  border-radius: 12px;
+  overflow-x: auto;
+}
+.mermaid { display: flex; justify-content: center; }
+
+pre {
+  background: var(--card-bg);
+  border: 1px solid var(--card-border);
+  border-radius: 8px;
+  padding: 20px;
+  margin: 16px 0;
+  overflow-x: auto;
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.85rem;
+  color: var(--gh-text-muted);
+  line-height: 1.6;
+}
+code {
+  font-family: 'JetBrains Mono', monospace;
+  font-size: 0.85em;
+  background: rgba(88,166,255,0.08);
+  padding: 2px 6px;
+  border-radius: 4px;
+  color: var(--gh-cyan);
+}
+pre code { background: none; padding: 0; color: inherit; }
+
+.callout {
+  background: rgba(210,153,34,0.08);
+  border-left: 4px solid var(--gh-orange);
+  padding: 20px 24px;
+  margin: 24px 0;
+  border-radius: 0 8px 8px 0;
+}
+.callout strong { color: var(--gh-orange); }
+
+.footer {
+  text-align: center;
+  padding: 40px 20px;
+  color: var(--gh-text-muted);
+  font-size: 0.85rem;
+  border-top: 1px solid var(--card-border);
+}
+.footer a { color: var(--gh-cyan); }
+
+@media (max-width: 768px) {
+  .hero { padding: 48px 16px 40px; }
+  .hero h1 { font-size: 1.8rem; }
+  section { padding: 40px 0; }
+  h2 { font-size: 1.5rem; }
+  .stats-row { grid-template-columns: repeat(2, 1fr); }
+}
+
+@media print {
+  .toc { display: none; }
+  section { break-inside: avoid; }
+  .mermaid-wrapper { break-inside: avoid; }
+}
+</style>
+</head>
+<body>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<!-- HERO                                                   -->
+<!-- ══════════════════════════════════════════════════════ -->
+<div class="hero">
+  <div class="hero-badge">Preuve de concept — Azure Kubernetes Service</div>
+  <h1>Déploiement AKS privé avec identité managée</h1>
+  <p class="subtitle">Contournement des stratégies d'accès conditionnel d'Entra ID pour le déploiement de clusters AKS privés avec l'identité managée Azure et des runners auto-hébergés</p>
+  <p class="hero-meta">
+    <span>📅 2 avril 2026</span>
+    <span>👤 devopsabcs-engineering</span>
+    <span>🏢 Microsoft Canada</span>
+  </p>
+  <div class="lang-switch">
+    <a href="index.html">🇬🇧 English</a>
+  </div>
+</div>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<!-- NAVIGATION                                             -->
+<!-- ══════════════════════════════════════════════════════ -->
+<nav class="toc">
+  <div class="toc-inner">
+    <a href="#sec1">Vue d'ensemble</a>
+    <a href="#sec2">Problème</a>
+    <a href="#sec3">Solution</a>
+    <a href="#sec4">Architecture</a>
+    <a href="#sec5">Workflows</a>
+    <a href="#sec6">Validation</a>
+    <a href="#sec7">Démarrage rapide</a>
+    <a href="#sec8">Références</a>
+  </div>
+</nav>
+
+<div class="container">
+
+<!-- ══════════════════════════════════════════════════════ -->
+<!-- SECTION 1 — VUE D'ENSEMBLE                             -->
+<!-- ══════════════════════════════════════════════════════ -->
+<section id="sec1">
+  <h2><span class="section-num">01</span> Vue d'ensemble</h2>
+  <p class="section-lead">Cette preuve de concept valide que l'identité managée Azure contourne les stratégies d'accès conditionnel (AC) d'Entra ID lors du déploiement de clusters AKS privés.</p>
+
+  <p>Les organisations ayant des stratégies AC strictes basées sur la localisation peuvent utiliser l'identité managée pour éviter les échecs d'authentification qui surviennent avec les principaux de service. Le PoC déploie un cluster AKS entièrement privé depuis un runner GitHub Actions auto-hébergé à l'intérieur du même VNet, démontrant la connectivité privée de bout en bout et le contournement de l'AC.</p>
+
+  <div class="stats-row">
+    <div class="stat-card">
+      <div class="stat-value">0,08 $</div>
+      <div class="stat-label">Coût par exécution de 30 min</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-value">3</div>
+      <div class="stat-label">Tâches automatisées</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-value">0</div>
+      <div class="stat-label">Évaluations AC déclenchées</div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-value">100 %</div>
+      <div class="stat-label">Accès API privé</div>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<!-- SECTION 2 — ÉNONCÉ DU PROBLÈME                         -->
+<!-- ══════════════════════════════════════════════════════ -->
+<section id="sec2">
+  <h2><span class="section-num">02</span> Énoncé du problème</h2>
+  <p class="section-lead">L'authentification par principal de service lors de la création AKS est bloquée par les stratégies d'accès conditionnel basées sur la localisation.</p>
+
+  <p>Lorsque le fournisseur de ressources AKS s'authentifie avec les informations d'identification d'un principal de service lors de l'exécution de <code>az aks create</code>, la connexion provient des adresses IP des centres de données Azure, et non du réseau du client. Si l'organisation applique des stratégies d'accès conditionnel qui restreignent l'authentification aux adresses IP du périmètre connu, ces stratégies bloquent la connexion du principal de service.</p>
+
+  <h3>Comparaison des flux d'authentification</h3>
+  <pre>
+FLUX PRINCIPAL DE SERVICE (PROBLÉMATIQUE) :
+VM Runner → az login --service-principal → login.microsoftonline.com (depuis IP du runner ✓)
+VM Runner → az aks create → ARM → AKS RP → login.microsoftonline.com (depuis IP du centre de données Azure ✗)
+                                                                       ↑ BLOQUÉ par l'AC
+
+FLUX IDENTITÉ MANAGÉE (RECOMMANDÉ) :
+VM Runner → az login --identity → IMDS 169.254.169.254 (interne, pas d'AC ✓)
+VM Runner → az aks create → ARM → AKS RP → jeton Azure fabric (interne, pas d'AC ✓)
+                                                                ↑ NON évalué par l'AC</pre>
+
+  <p>La distinction est architecturale : les identités managées ne déclenchent pas l'accès conditionnel car leurs informations d'identification sont gérées par Azure et l'émission de jetons s'effectue au sein de l'infrastructure Azure. Il n'y a pas d'« adresse IP source » à évaluer par l'AC.</p>
+</section>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<!-- SECTION 3 — SOLUTION                                   -->
+<!-- ══════════════════════════════════════════════════════ -->
+<section id="sec3">
+  <h2><span class="section-num">03</span> Solution</h2>
+  <p class="section-lead">L'identité managée contourne entièrement l'accès conditionnel — les jetons sont acquis en interne via IMDS, et non via login.microsoftonline.com.</p>
+
+  <blockquote><strong>« Les identités managées ne sont pas couvertes par les stratégies. »</strong> — Documentation Microsoft sur l'accès conditionnel pour les identités de charge de travail</blockquote>
+
+  <div class="card-grid">
+    <div class="card">
+      <span class="card-icon">🔐</span>
+      <h4>Acquisition de jetons IMDS</h4>
+      <p>Les jetons MI sont acquis via <code>169.254.169.254</code> — un point de terminaison interne de l'infrastructure Azure. Aucune connexion externe ne se produit.</p>
+    </div>
+    <div class="card">
+      <span class="card-icon">🛡️</span>
+      <h4>Contournement du moteur AC</h4>
+      <p>Le moteur d'accès conditionnel n'évalue pas du tout les demandes de jetons d'identité managée. Aucune adresse IP source n'est exposée pour évaluation.</p>
+    </div>
+    <div class="card">
+      <span class="card-icon">🌐</span>
+      <h4>Runner dans le VNet</h4>
+      <p>Une VM runner auto-hébergée dans le même VNet que le cluster AKS assure l'accès API privé et l'authentification basée sur IMDS.</p>
+    </div>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<!-- SECTION 4 — ARCHITECTURE                               -->
+<!-- ══════════════════════════════════════════════════════ -->
+<section id="sec4">
+  <h2><span class="section-num">04</span> Architecture</h2>
+  <p class="section-lead">Workflow à trois tâches sur deux types de runners : hébergé par GitHub pour le provisionnement de l'infrastructure, auto-hébergé pour le déploiement AKS privé.</p>
+
+  <div class="mermaid-wrapper">
+    <pre class="mermaid">
+graph TD
+    A["GitHub workflow_dispatch"] -->|ubuntu-latest| B["Tâche 1 : Configuration de l'infrastructure"]
+    B --> B1["Créer VNet\nsubnet-aks + subnet-runner"]
+    B1 --> B2["Créer MI + RBAC"]
+    B2 --> B3["Créer VM Runner\ndans subnet-runner"]
+    B3 --> B4["Enregistrer le runner GH Actions"]
+
+    B4 -->|runner auto-hébergé| C["Tâche 2 : Déploiement + Validation"]
+    C --> C1["az login --identity via IMDS"]
+    C1 --> C2["az aks create\n--enable-private-cluster\ndans subnet-aks"]
+    C2 --> C3{"Déploiement OK ?"}
+    C3 -->|Oui| C4["kubectl get nodes\nvia point de terminaison privé"]
+    C4 --> C5["Journaliser les IP + Téléverser les artéfacts"]
+    C3 -->|Non| C5
+    C5 --> C6["Attendre N minutes"]
+    C6 --> C7["Supprimer le RG AKS"]
+
+    C7 -->|ubuntu-latest| D["Tâche 3 : Nettoyage"]
+    D --> D1["Désenregistrer le runner"]
+    D1 --> D2["Supprimer le RG d'infrastructure"]
+
+    style A fill:#1e1b4b,stroke:#4f46e5,color:#e6edf3
+    style B fill:#1e3a5f,stroke:#3b82f6,color:#e6edf3
+    style C fill:#3b0764,stroke:#7c3aed,color:#e6edf3
+    style D fill:#4a1530,stroke:#e11d48,color:#e6edf3
+    style C3 fill:#78350f,stroke:#d97706,color:#e6edf3
+    style C4 fill:#064e3b,stroke:#059669,color:#e6edf3
+    </pre>
+  </div>
+
+  <h3>Architecture réseau</h3>
+  <div class="mermaid-wrapper">
+    <pre class="mermaid">
+graph LR
+    subgraph VNET["VNet partagé — 10.224.0.0/16"]
+        direction LR
+        subgraph SAKS["subnet-aks\n10.224.0.0/24"]
+            AKS["Cluster AKS privé\nAPI : 10.224.0.4\nNœud : 10.224.0.5"]
+        end
+        subgraph SRUNNER["subnet-runner\n10.224.1.0/24"]
+            RUNNER["VM Runner\n10.224.1.4"]
+        end
+        RUNNER -->|"point de terminaison privé"| AKS
+    end
+
+    RUNNER -->|"IMDS\n169.254.169.254"| FABRIC["Azure Fabric\nÉmission de jetons"]
+
+    style VNET fill:#0c1929,stroke:#3b82f6,stroke-width:2px,color:#e6edf3
+    style SAKS fill:#1a0a2e,stroke:#7c3aed,color:#e6edf3
+    style SRUNNER fill:#0a2e1e,stroke:#059669,color:#e6edf3
+    style FABRIC fill:#1e1b4b,stroke:#4f46e5,color:#e6edf3
+    </pre>
+  </div>
+
+  <h3>Flux d'identité</h3>
+  <div class="mermaid-wrapper">
+    <pre class="mermaid">
+graph LR
+    A["VM Runner"] -->|"az login --identity"| B["IMDS\n169.254.169.254"]
+    B -->|"jeton MI"| C["Azure Fabric"]
+    A -->|"az aks create"| D["ARM"]
+    D --> E["AKS RP"]
+    E -->|"MI du cluster via IMDS"| C
+
+    style A fill:#0a2e1e,stroke:#059669,color:#e6edf3
+    style B fill:#1e1b4b,stroke:#4f46e5,color:#e6edf3
+    style C fill:#064e3b,stroke:#059669,stroke-width:2px,color:#e6edf3
+    style D fill:#1e293b,stroke:#64748b,color:#e6edf3
+    style E fill:#1e293b,stroke:#64748b,color:#e6edf3
+    </pre>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<!-- SECTION 5 — WORKFLOWS                                  -->
+<!-- ══════════════════════════════════════════════════════ -->
+<section id="sec5">
+  <h2><span class="section-num">05</span> Workflows GitHub Actions</h2>
+  <p class="section-lead">Cycle de vie de l'infrastructure entièrement automatisé — provisionnement, déploiement, validation et nettoyage en une seule exécution de workflow.</p>
+
+  <h3>deploy-private-aks.yml</h3>
+  <p>Un workflow à trois tâches déclenché par <code>workflow_dispatch</code> :</p>
+
+  <div class="card-grid">
+    <div class="card">
+      <span class="card-icon">🏗️</span>
+      <h4>Tâche 1 : setup-runner</h4>
+      <p>S'exécute sur <code>ubuntu-latest</code> via OIDC. Crée un VNet partagé avec deux sous-réseaux, provisionne une identité managée avec RBAC, crée une VM runner et l'enregistre comme runner auto-hébergé.</p>
+    </div>
+    <div class="card">
+      <span class="card-icon">🚀</span>
+      <h4>Tâche 2 : deploy-and-log</h4>
+      <p>S'exécute sur le runner auto-hébergé. S'authentifie via l'identité managée (IMDS), déploie un AKS privé dans <code>subnet-aks</code>, valide avec <code>kubectl</code>, journalise les IP et téléverse les artéfacts.</p>
+    </div>
+    <div class="card">
+      <span class="card-icon">🧹</span>
+      <h4>Tâche 3 : teardown-runner</h4>
+      <p>S'exécute sur <code>ubuntu-latest</code>. Désenregistre le runner, supprime les groupes de ressources AKS et d'infrastructure. S'exécute toujours, même en cas d'échec.</p>
+    </div>
+  </div>
+
+  <h3>cleanup-safety-net.yml</h3>
+  <p>Un workflow déclenché manuellement qui recherche les groupes de ressources correspondant au modèle <code>rg-aks-poc-*</code> datant de plus de 45 minutes. Sert de filet de sécurité pour les ressources orphelines.</p>
+</section>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<!-- SECTION 6 — VALIDATION                                 -->
+<!-- ══════════════════════════════════════════════════════ -->
+<section id="sec6">
+  <h2><span class="section-num">06</span> Exécution vérifiée — 2 avril 2026</h2>
+  <p class="section-lead">Les 3 tâches ont réussi. Objectifs du PoC confirmés. <a href="https://github.com/devopsabcs-engineering/aks-private-deployment/actions/runs/23919580744" target="_blank">Exécution du workflow #23919580744</a></p>
+
+  <h3>Exécution des tâches</h3>
+  <div class="table-wrapper">
+    <table>
+      <thead><tr><th>Tâche</th><th>Runner</th><th>Durée</th><th>Résultat</th></tr></thead>
+      <tbody>
+        <tr><td><strong>setup-runner</strong></td><td><code>ubuntu-latest</code></td><td>7 min</td><td>✅ Succès</td></tr>
+        <tr><td><strong>deploy-and-log</strong></td><td><code>self-hosted</code> (dans le VNet)</td><td>40 min (incl. 30 min d'attente)</td><td>✅ Succès</td></tr>
+        <tr><td><strong>teardown-runner</strong></td><td><code>ubuntu-latest</code></td><td>18 sec</td><td>✅ Succès</td></tr>
+      </tbody>
+    </table>
+  </div>
+
+  <h3>Constat 1 : L'identité managée contourne l'accès conditionnel</h3>
+  <p>Le journal d'activité Azure confirme que l'opération d'écriture ARM <code>az aks create</code> provient de l'adresse IP <code>20.104.78.99</code> — l'adresse IP publique de la VM runner. L'authentification s'est effectuée via IMDS, et non via <code>login.microsoftonline.com</code>. Aucune évaluation d'AC n'a été déclenchée.</p>
+
+  <pre>
+Extrait du journal d'activité :
+  Microsoft.ContainerService/managedClusters/write  Accepted  ClientIp: 20.104.78.99
+  Microsoft.ContainerService/managedClusters/write  Started   ClientIp: 20.104.78.99</pre>
+
+  <h3>Constat 2 : Le cluster privé est véritablement privé</h3>
+  <pre>
+enablePrivateCluster : true
+privateFqdn          : aks-poc-23-...privatelink.canadacentral.azmk8s.io
+API Server Endpoint  : https://...privatelink.canadacentral.azmk8s.io:443
+Le FQDN privé résout : 10.224.0.4 (adresse IP privée au sein du VNet)</pre>
+
+  <h3>Constat 3 : Le runner dans le même VNet atteint le serveur API privé</h3>
+  <div class="stats-row">
+    <div class="stat-card">
+      <div class="stat-value">10.224.1.4</div>
+      <div class="stat-label">VM Runner<br><small>subnet-runner</small></div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-value">10.224.0.4</div>
+      <div class="stat-label">Serveur API<br><small>point de terminaison privé</small></div>
+    </div>
+    <div class="stat-card">
+      <div class="stat-value">10.224.0.5</div>
+      <div class="stat-label">Nœud AKS<br><small>subnet-aks</small></div>
+    </div>
+  </div>
+
+  <pre>
+kubectl cluster-info  → Plan de contrôle Kubernetes à ...privatelink.canadacentral.azmk8s.io:443
+kubectl get nodes     → 1 nœud, Ready, v1.34.4
+kubectl get pods -n kube-system → 15 pods, tous en cours d'exécution
+kubectl get namespaces → default, kube-node-lease, kube-public, kube-system
+nslookup FQDN privé → 10.224.0.4 ✓</pre>
+
+  <h3>Constat 4 : Artéfacts téléversés</h3>
+  <div class="table-wrapper">
+    <table>
+      <thead><tr><th>Fichier de journal</th><th>Contenu</th></tr></thead>
+      <tbody>
+        <tr><td><strong>runner-network.log</strong></td><td>IP publique/privée de la VM runner, nom d'hôte, sous-réseau</td></tr>
+        <tr><td><strong>aks-create.log</strong></td><td>Sortie complète de <code>az aks create</code> (9 Ko)</td></tr>
+        <tr><td><strong>aks-cluster-info.log</strong></td><td>Propriétés du cluster (version, FQDN, configuration réseau)</td></tr>
+        <tr><td><strong>kubectl-validation.log</strong></td><td>Toute la sortie kubectl incluant la résolution DNS</td></tr>
+        <tr><td><strong>ip-activity-log.log</strong></td><td>IP des appelants des opérations ARM du journal d'activité Azure</td></tr>
+        <tr><td><strong>ip-signin-log.log</strong></td><td>Requête de connexion Entra (erreur 403 attendue sans P1/P2)</td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<!-- SECTION 7 — DÉMARRAGE RAPIDE                           -->
+<!-- ══════════════════════════════════════════════════════ -->
+<section id="sec7">
+  <h2><span class="section-num">07</span> Démarrage rapide</h2>
+  <p class="section-lead">Exécutez le PoC dans votre abonnement en quelques minutes.</p>
+
+  <h3>Prérequis</h3>
+  <ul>
+    <li>Abonnement Azure avec les permissions de créer des clusters AKS, des VM, des VNets et des identités managées</li>
+    <li>Enregistrement d'application Azure AD avec des informations d'identification fédérées OIDC pour GitHub Actions</li>
+    <li>Principal de service OIDC avec les rôles <code>Contributeur</code> + <code>Administrateur de l'accès utilisateur</code> au niveau de l'abonnement</li>
+    <li>Dépôt GitHub avec Actions activé</li>
+    <li>PAT GitHub (secret <code>GH_PAT</code>) avec le scope <code>repo</code></li>
+  </ul>
+
+  <h3>Étapes de configuration</h3>
+  <ol>
+    <li>Créer un enregistrement d'application Azure AD avec des informations d'identification fédérées OIDC pour la branche <code>main</code></li>
+    <li>Attribuer les rôles <code>Contributeur</code> + <code>Administrateur de l'accès utilisateur</code> au niveau de l'abonnement</li>
+    <li>Ajouter les secrets GitHub Actions :
+      <ul>
+        <li><code>AZURE_CLIENT_ID</code> — Identifiant client de l'enregistrement d'application</li>
+        <li><code>AZURE_TENANT_ID</code> — Identifiant du locataire Entra ID</li>
+        <li><code>AZURE_SUBSCRIPTION_ID</code> — Identifiant de l'abonnement cible</li>
+        <li><code>GH_PAT</code> — PAT GitHub avec le scope <code>repo</code></li>
+      </ul>
+    </li>
+    <li>Déclencher le workflow <strong>deploy-private-aks</strong> depuis l'interface GitHub Actions</li>
+  </ol>
+
+  <div class="callout">
+    <p><strong>⚠️ Important :</strong> La tâche 3 du workflow s'exécute toujours (même en cas d'échec) et supprime les groupes de ressources AKS et d'infrastructure. Le nettoyage manuel n'est nécessaire que si le workflow lui-même est annulé avant l'exécution de la tâche 3.</p>
+  </div>
+
+  <h3>Estimation des coûts</h3>
+  <p>Chaque exécution de PoC de 30 minutes coûte environ <strong>0,05 $ à 0,08 $</strong> avec un seul nœud Standard_B2s sur le plan de contrôle AKS gratuit. La VM runner ne fonctionne que pendant la durée du workflow et est automatiquement supprimée.</p>
+</section>
+
+<!-- ══════════════════════════════════════════════════════ -->
+<!-- SECTION 8 — RÉFÉRENCES                                 -->
+<!-- ══════════════════════════════════════════════════════ -->
+<section id="sec8">
+  <h2><span class="section-num">08</span> Références</h2>
+  <p class="section-lead">Documentation officielle et dépôt source.</p>
+
+  <div class="table-wrapper">
+    <table>
+      <thead><tr><th>Ressource</th><th>Lien</th></tr></thead>
+      <tbody>
+        <tr><td><strong>Dépôt source</strong></td><td><a href="https://github.com/devopsabcs-engineering/aks-private-deployment" target="_blank">devopsabcs-engineering/aks-private-deployment</a></td></tr>
+        <tr><td>Clusters AKS privés Azure</td><td><a href="https://learn.microsoft.com/fr-fr/azure/aks/private-clusters?pivots=azure-cli" target="_blank">learn.microsoft.com</a></td></tr>
+        <tr><td>Utiliser l'identité managée avec AKS</td><td><a href="https://learn.microsoft.com/fr-fr/azure/aks/use-managed-identity" target="_blank">learn.microsoft.com</a></td></tr>
+        <tr><td>Accès conditionnel pour les identités de charge de travail</td><td><a href="https://learn.microsoft.com/fr-fr/entra/identity/conditional-access/workload-identity" target="_blank">learn.microsoft.com</a></td></tr>
+      </tbody>
+    </table>
+  </div>
+</section>
+
+</div><!-- /container -->
+
+<div class="footer">
+  <p>PoC de déploiement AKS privé — <a href="https://github.com/devopsabcs-engineering/aks-private-deployment" target="_blank">Voir sur GitHub</a></p>
+  <p style="margin-top: 8px;">devopsabcs-engineering | Microsoft Canada</p>
+</div>
+
+<script>
+mermaid.initialize({
+  startOnLoad: true,
+  theme: 'dark',
+  themeVariables: {
+    darkMode: true,
+    background: '#161b22',
+    primaryColor: '#1e1b4b',
+    primaryTextColor: '#e6edf3',
+    primaryBorderColor: '#4f46e5',
+    lineColor: '#58a6ff',
+    secondaryColor: '#3b0764',
+    tertiaryColor: '#064e3b',
+    fontFamily: 'Inter, -apple-system, sans-serif',
+    fontSize: '14px'
+  },
+  flowchart: {
+    htmlLabels: true,
+    curve: 'basis',
+    padding: 15,
+    nodeSpacing: 50,
+    rankSpacing: 50
+  }
+});
+</script>
+</body>
+</html>
